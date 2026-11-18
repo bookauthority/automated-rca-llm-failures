@@ -1,0 +1,684 @@
+{
+  "experiment_id": "exp-12-automated-remediation-guardrails-mttr",
+  "hypothesis": "Introducing a guarded automated remediation orchestrator that converts RCA outputs into controlled configuration and routing changes\u2014under explicit guardrails, approval policies, and rollbacks\u2014will reduce median Mean Time To Resolve (MTTR) LLM incidents by at least 30% compared to a manual-remediation-only workflow, without increasing the rate of unsafe or incorrect remediations.",
+  "baseline": {
+    "description": "Manual remediation workflow driven by RCA dashboards and alerts, with no automated configuration or routing changes.",
+    "characteristics": [
+      "RCA pipeline (from prior chapters) produces structured incident objects and recommendations, but all changes are applied manually by on-call engineers.",
+      "No automated writes to feature flags, config stores, or deployment systems; engineers follow runbooks and edit configs or trigger rollbacks by hand.",
+      "Approvals and audits are captured via the existing incident management system (e.g., Jira, ServiceNow, PagerDuty) and chat (e.g., Slack, MS Teams).",
+      "Incident lifecycle states (DETECTED, DIAGNOSED, FIX_IN_PROGRESS, RESOLVED) are updated manually in the incident tracker.",
+      "No orchestrator-level guardrails beyond what exists in downstream systems (e.g., change management policies, CI/CD checks).",
+      "Simulation environment: synthetic LLM incident generator triggers events and RCA outputs; a scripted manual-responder process (or human-in-the-loop) applies remediations according to runbooks, incurring realistic decision and execution latency."
+    ]
+  },
+  "treatment": {
+    "description": "Automated remediation orchestrator that safely maps RCA outputs into guarded remediation actions integrated with feature flags, config stores, and deployment systems, with human-in-the-loop approvals based on risk level.",
+    "characteristics": [
+      "A remediation orchestrator service consumes structured RCA outputs (incident objects with ranked root causes and recommended actions).",
+      "Actions are mapped to concrete remediation primitives: feature flag toggles, prompt/config rollbacks, model routing changes, and deployment rollbacks.",
+      "Guardrails enforce:",
+      "  - Risk-aware policies (e.g., low-risk actions auto-applied, medium/high-risk actions require human approval).",
+      "  - Blast-radius limits (e.g., max % of traffic, environment scope, tenant allowlists).",
+      "  - Rate limits and concurrency caps on automated changes.",
+      "  - Automatic rollback on negative post-change signals.",
+      "Integration with existing systems:",
+      "  - Feature flag service (e.g., LaunchDarkly-like HTTP API or in-repo mock).",
+      "  - Config store (e.g., GitOps-style repo or key-value store).",
+      "  - Deployment/rollout API (e.g., canary rollback endpoint).",
+      "Human-in-the-loop:",
+      "  - Approval UI or CLI (can be simulated via scripted approval latency) for medium/high-risk changes.",
+      "  - Overrides and veto capability (humans can cancel or modify proposed actions).",
+      "Orchestrator emits detailed audit logs of all proposed, approved, executed, and rolled-back remediations.",
+      "Simulation environment identical to baseline (same incident generator, RCA outputs, and workload patterns), but the orchestrator automatically executes allowed actions once triggered."
+    ]
+  },
+  "workloads": [
+    {
+      "name": "workload_incident_mix_v1",
+      "description": "Synthetic incident stream with a controlled mix of LLM failure types (prompt regressions, routing misconfigurations, RAG data issues, tool failures, and latency/cost regressions) driving RCA outputs and candidate remediations.",
+      "traffic_profile": {
+        "request_rate_rps": 50,
+        "duration_minutes": 120,
+        "incident_injection": {
+          "pattern": "Poisson process plus scheduled injections",
+          "average_incidents_per_hour": 12,
+          "incident_types": [
+            {
+              "type": "prompt_regression",
+              "weight": 0.25,
+              "description": "New prompt template causing hallucination and quality regressions.",
+              "canonical_remediation": "Rollback to previous prompt version via config change."
+            },
+            {
+              "type": "routing_misconfiguration",
+              "weight": 0.2,
+              "description": "Traffic incorrectly routed from Model_A to slower/more expensive Model_B.",
+              "canonical_remediation": "Update routing config or feature flag to correct route; optionally canary rollback."
+            },
+            {
+              "type": "rag_retrieval_degradation",
+              "weight": 0.2,
+              "description": "Embedding/index configuration error leading to low-recall retrieval.",
+              "canonical_remediation": "Rollback embedding configuration or re-enable last known-good index version."
+            },
+            {
+              "type": "tool_failure",
+              "weight": 0.2,
+              "description": "External tool (API) flakiness or outage causing tool-call failures in agents.",
+              "canonical_remediation": "Temporarily disable affected tool or route calls to fallback tool via feature flag."
+            },
+            {
+              "type": "latency_cost_regression",
+              "weight": 0.15,
+              "description": "Model upgrade or config change leading to p95 latency and cost spikes.",
+              "canonical_remediation": "Rollback model version or adjust concurrency/timeout settings."
+            }
+          ]
+        }
+      },
+      "rca_output_generation": {
+        "source": "Companion repo RCA pipeline from earlier chapters (e.g., ./pipelines/rca). For reproducibility, a deterministic script should take incident ground truth and generate structured RCA outputs with ranked hypotheses and recommended remediations.",
+        "format": "JSON objects on a message bus or topic, e.g., Kafka topic `rca.incident.outputs` or local in-memory queue.",
+        "fields_required": [
+          "incident_id",
+          "detected_at",
+          "incident_type",
+          "severity",
+          "suspected_root_causes",
+          "recommended_actions",
+          "confidence_score"
+        ]
+      },
+      "distribution_between_baseline_and_treatment": "Identical incident seeds and injection schedule must be reused between baseline and treatment runs (e.g., by seeding RNG with a fixed seed and persisting generated incident scripts)."
+    }
+  ],
+  "controls": {
+    "experiment_design": "A/B-style, sequential runs with identical synthetic incident scripts and traffic patterns.",
+    "randomization_and_reproducibility": [
+      "Use a fixed random seed to generate the incident timeline and parameters (start time, duration, severity, affected component, etc.).",
+      "Persist the generated incident script for reuse across baseline and treatment runs (e.g., JSON file listing all incidents and ground truth remediations)."
+    ],
+    "held_constant": [
+      "Underlying LLM models, prompts, data stores, and infrastructure configuration (no changes between baseline and treatment aside from enabling the orchestrator).",
+      "RCA pipeline configuration and detection thresholds.",
+      "Incident generator parameters and traffic profile.",
+      "Incident severity distribution and type mix.",
+      "Monitoring and observability stack (metrics/logs/traces collectors and dashboards)."
+    ],
+    "variables_of_interest": [
+      "Presence vs. absence of the remediation orchestrator and its automation policies.",
+      "Risk thresholds for auto-remediation vs. human approval.",
+      "Guardrail strictness (e.g., allowed blast radius, rollback sensitivity)."
+    ],
+    "run_order_and_repetition": [
+      "Run baseline first to validate instrumentation and MTTR measurement.",
+      "Run treatment using the same incident script.",
+      "Repeat the pair of runs N times (e.g., N=5\u201310) with different seeds to estimate variance; each pair uses a shared seed but differs from other pairs.",
+      "Optionally interleave baseline and treatment runs (B1, T1, B2, T2, \u2026) if environmental drift is a concern in more complex deployments."
+    ],
+    "blinding_and_bias_mitigation": [
+      "In fully simulated approval flows, human bias is not a factor (approvals modeled as scripted latencies).",
+      "If using real humans in the loop, do not inform them whether they are in baseline or treatment; they simply see incident tickets and orchestrator prompts (or lack thereof)."
+    ]
+  },
+  "metrics": [
+    {
+      "name": "mttr_minutes",
+      "unit": "minutes",
+      "description": "Mean Time To Resolve per incident: time from incident detection timestamp (as produced by the detection pipeline) to resolution timestamp (as marked when the system returns to acceptable SLOs and the orchestrator or operator marks the incident RESOLVED). Compute median and mean across incidents."
+    },
+    {
+      "name": "time_to_first_mitigation_minutes",
+      "unit": "minutes",
+      "description": "Time from incident detection to first effective mitigating action being applied (e.g., feature flag toggle, config rollback, or routing change that measurably reduces impact), regardless of final resolution time."
+    },
+    {
+      "name": "num_remediations_per_incident",
+      "unit": "count",
+      "description": "Number of distinct remediation actions executed per incident (including rollbacks), used as a proxy for thrashiness and over-correction."
+    },
+    {
+      "name": "incorrect_remediation_rate",
+      "unit": "fraction",
+      "description": "Fraction of incidents where at least one remediation action was misaligned with the ground truth root cause (e.g., toggled the wrong flag, rolled back the wrong prompt) or degraded key SLOs, as determined by post-hoc comparison to the known canonical remediation in the simulation."
+    },
+    {
+      "name": "unsafe_change_rate",
+      "unit": "fraction",
+      "description": "Fraction of remediation actions that violated predefined safety policies (e.g., exceeded blast-radius limits, modified production instead of staging in a simulation, or skipped required approvals in medium/high-risk scenarios)."
+    },
+    {
+      "name": "rollback_rate",
+      "unit": "fraction",
+      "description": "Fraction of remediation actions that were subsequently rolled back due to negative signal or explicit operator veto."
+    },
+    {
+      "name": "human_approval_latency_minutes",
+      "unit": "minutes",
+      "description": "For actions requiring human approval in treatment runs, distribution (mean, median, p90) of time between orchestrator proposal and approval/denial."
+    },
+    {
+      "name": "orchestrator_decision_latency_seconds",
+      "unit": "seconds",
+      "description": "Time between receipt of an RCA output and orchestrator decision to propose or execute a remediation action, excluding human approval time."
+    },
+    {
+      "name": "incident_recurrence_rate",
+      "unit": "fraction",
+      "description": "Fraction of incidents where a similar failure (same ground-truth root cause type) recurs within a fixed time window after initial resolution, indicating failure to prevent recurrence."
+    }
+  ],
+  "success_criteria": {
+    "primary": [
+      "Median mttr_minutes in the treatment (automated orchestrator) condition is at least 30% lower than in the baseline condition, with non-overlapping 95% bootstrapped confidence intervals for median MTTR across repeated runs.",
+      "incorrect_remediation_rate in treatment is not more than 5 percentage points higher than in baseline (ideally equal or lower).",
+      "unsafe_change_rate in treatment is <= 1% of all remediation actions (ideally zero) across all runs."
+    ],
+    "secondary": [
+      "median time_to_first_mitigation_minutes is reduced by at least 40% in treatment compared to baseline.",
+      "rollback_rate in treatment is not significantly higher than in baseline (threshold configurable; e.g., <= baseline + 10 percentage points), indicating that faster actions do not excessively increase thrash.",
+      "incident_recurrence_rate is not higher in treatment than in baseline, indicating that automation does not favor superficial or temporary fixes over root cause-focused remediations."
+    ],
+    "interpretation_guidelines": [
+      "If MTTR improves substantially but incorrect_remediation_rate or unsafe_change_rate materially increase, treat the orchestrator configuration as unsafe; emphasize guardrail tuning (Section 12.1, 12.7) rather than declaring outright success.",
+      "If no MTTR improvement is observed, investigate whether the orchestrator is overly constrained by guardrails or human-approval latency dominates; adjust policies and rerun."
+    ]
+  },
+  "failure_modes": [
+    {
+      "name": "orchestrator_overreach",
+      "description": "Orchestrator executes aggressive remediations (e.g., wide-scope flag toggles or production rollbacks) without sufficient guardrails, causing unsafe_change_rate to spike.",
+      "detection": "Monitor unsafe_change_rate and audit logs for actions exceeding configured blast radius or policy constraints; alert if thresholds exceeded.",
+      "mitigation": "Tighten policy configuration (e.g., reduce environment scope, require approvals for more action types), re-run experiments, and compare metrics."
+    },
+    {
+      "name": "orchestrator_underreach",
+      "description": "Orchestrator is too conservative, resulting in few or no automated actions. MTTR shows negligible improvement compared to baseline.",
+      "detection": "Count orchestrator proposals and executed actions per incident. If most eligible incidents receive no automated actions, classify as underreach.",
+      "mitigation": "Relax automation thresholds (e.g., auto-approve low-risk categories, broaden eligible incident types) and re-run."
+    },
+    {
+      "name": "approval_latency_dominance",
+      "description": "Human approval delays dominate end-to-end resolution time, overshadowing orchestrator benefits.",
+      "detection": "Compare human_approval_latency_minutes to orchestrator_decision_latency_seconds. If the former accounts for the majority of MTTR, flag.",
+      "mitigation": "Segment incidents by risk class; expand auto-remediation for low-risk cases and streamline approval UI or processes for higher-risk actions."
+    },
+    {
+      "name": "incorrect_action_mapping",
+      "description": "Systematic errors in mapping RCA outputs to concrete remediation actions (e.g., wrong feature flag keys, mis-labeled prompt versions).",
+      "detection": "High incorrect_remediation_rate with clustered failure modes; detailed log inspection shows misaligned or no-op changes.",
+      "mitigation": "Add validation checks (dry-run mode, pre-flight sanity checks against metadata), improve RCA-to-action mapping configuration, and re-run tests with unit-level validations."
+    },
+    {
+      "name": "rollback_feedback_instability",
+      "description": "Aggressive rollback policies lead to oscillations (apply change, rollback, reapply) and high rollback_rate, potentially increasing incident duration.",
+      "detection": "Observe multiple alternating actions for the same incident and elevated rollback_rate above baseline plus configured margin.",
+      "mitigation": "Introduce hysteresis (e.g., minimum observation window before rollback), dampening logic, and more robust post-change validation (Section 12.7)."
+    },
+    {
+      "name": "simulation_reality_gap",
+      "description": "Synthetic incident generator and RCA outputs are not representative of real LLM incidents, making experiment results over-optimistic.",
+      "detection": "Compare incident type and severity distributions and MTTR ranges from real historical incidents to those in the simulation; large discrepancies flag this mode.",
+      "mitigation": "Refine incident generator parameters and RCA behavior to mirror historical data more closely; annotate experiment results as synthetic-only when reporting."
+    }
+  ],
+  "required_environment": {
+    "infrastructure": [
+      "Kubernetes cluster or equivalent container orchestration, or a docker-compose environment sufficient to run:",
+      "  - LLM service simulator (mock endpoints with failure injection support).",
+      "  - RCA pipeline services from earlier chapters (e.g., collectors, correlators, analyzers).",
+      "  - Remediation orchestrator service.",
+      "  - Feature flag and config store mock services.",
+      "  - Deployment/rollout simulator.",
+      "  - Metrics and logging stack (e.g., Prometheus + Grafana, plus structured logs to files or ELK)."
+    ],
+    "software_dependencies": [
+      "Python 3.10+ with dependencies defined in the companion repository (e.g., requirements.txt or pyproject.toml).",
+      "Message bus library or service (e.g., Kafka, NATS, or an in-memory queue abstraction provided in the repo).",
+      "HTTP client libraries for interacting with feature flag, config store, and deployment APIs (or local mocks).",
+      "Experiment harness tooling (e.g., Python scripts or notebooks under ./experiments/ch12_automated_remediation)."
+    ],
+    "repository_layout_assumptions": [
+      "Remediation orchestrator code under: ./services/remediation_orchestrator/",
+      "RCA output simulator or connector under: ./pipelines/rca/",
+      "Incident generator under: ./simulations/incidents/",
+      "Feature flag and config store mocks under: ./mocks/feature_flags/ and ./mocks/config_store/",
+      "Experiment orchestration scripts and analysis notebooks under: ./experiments/ch12_automated_remediation/"
+    ],
+    "configuration": [
+      "YAML or JSON configuration file specifying:",
+      "  - Risk categories per incident type.",
+      "  - Guardrail policies (max blast radius, environments allowed, max actions per time window).",
+      "  - Mapping from RCA recommended_actions to concrete API calls on feature flag/config/deployment services.",
+      "Separation of baseline vs. treatment configurations using environment variables or separate config files (e.g., configs/ch12/baseline.yaml and configs/ch12/treatment.yaml)."
+    ]
+  },
+  "run_instructions": [
+    "1. Clone the companion repository and navigate to the experiment directory:",
+    "   git clone https://github.com/bookauthority/automated-rca-llm-failures.git",
+    "   cd automated-rca-llm-failures",
+    "   cd experiments/ch12_automated_remediation",
+    "",
+    "2. Set up the Python environment and install dependencies:",
+    "   python -m venv .venv",
+    "   source .venv/bin/activate  # or .venv\\Scripts\\activate on Windows",
+    "   pip install -r ../../requirements.txt  # or project-specific requirements file",
+    "",
+    "3. Start required mock services (feature flags, config store, deployment simulator, LLM service simulator, RCA pipeline) using docker-compose or provided scripts:",
+    "   docker-compose -f docker-compose.ch12.yml up -d",
+    "   # Alternatively, use provided launch script:",
+    "   # ./scripts/start_ch12_stack.sh",
+    "",
+    "4. Generate a deterministic incident script for the experiment (using a fixed seed):",
+    "   python ./generate_incident_script.py \\",
+    "       --output ./artifacts/incident_script_seed_123.json \\",
+    "       --seed 123 \\",
+    "       --duration-minutes 120 \\",
+    "       --avg-incidents-per-hour 12",
+    "",
+    "5. BASELINE RUN (manual remediation):",
+    "   a. Configure the system to use the baseline configuration (no orchestrator actions):",
+    "      export RCA_ENV=baseline",
+    "      # Ensure orchestrator is either disabled or running in 'observe-only' mode",
+    "      cp ./configs/ch12/baseline.yaml ./configs/active.yaml",
+    "",
+    "   b. Start the incident replay and traffic generator using the generated incident script:",
+    "      python ./run_simulation.py \\",
+    "          --incident-script ./artifacts/incident_script_seed_123.json \\",
+    "          --mode baseline \\",
+    "          --output-metrics ./artifacts/baseline_metrics_seed_123.json",
+    "",
+    "      # In fully simulated mode, a 'manual responder' module will apply remediations",
+    "      # according to encoded runbooks and with configured human-latency distributions.",
+    "",
+    "   c. Wait for the run to complete (120 minutes simulated time; may be accelerated in wall-clock time).",
+    "",
+    "6. TREATMENT RUN (automated remediation orchestrator):",
+    "   a. Enable the remediation orchestrator and treatment configuration:",
+    "      export RCA_ENV=treatment",
+    "      cp ./configs/ch12/treatment.yaml ./configs/active.yaml",
+    "",
+    "      # Ensure the orchestrator service is running and subscribed to RCA outputs:",
+    "      python ../../services/remediation_orchestrator/main.py \\",
+    "          --config ./configs/active.yaml &",
+    "",
+    "   b. Reuse the exact same incident script for comparability:",
+    "      python ./run_simulation.py \\",
+    "          --incident-script ./artifacts/incident_script_seed_123.json \\",
+    "          --mode treatment \\",
+    "          --output-metrics ./artifacts/treatment_metrics_seed_123.json",
+    "",
+    "   c. Ensure that guardrails and approval simulation parameters are correctly set in treatment.yaml.",
+    "",
+    "7. REPEAT FOR MULTIPLE SEEDS (optional but recommended):",
+    "   For seeds in {123, 456, 789, ...}, repeat Steps 4\u20136, generating new incident scripts and recording metrics files:",
+    "      python ./generate_incident_script.py --output ./artifacts/incident_script_seed_456.json --seed 456 ...",
+    "      # Run baseline and treatment as above, writing metrics to appropriately named files.",
+    "",
+    "8. ANALYZE RESULTS:",
+    "   a. Use the provided analysis script or notebook to aggregate metrics across runs:",
+    "      python ./analyze_results.py \\",
+    "          --baseline-pattern './artifacts/baseline_metrics_seed_*.json' \\",
+    "          --treatment-pattern './artifacts/treatment_metrics_seed_*.json' \\",
+    "          --output ./artifacts/ch12_summary_metrics.json",
+    "",
+    "   b. The analysis script should compute, at minimum:",
+    "      - mean and median MTTR per condition and per incident type, with 95% bootstrap CIs;",
+    "      - distributions of incorrect_remediation_rate, unsafe_change_rate, rollback_rate;",
+    "      - time_to_first_mitigation distributions.",
+    "",
+    "   c. Inspect Grafana dashboards or equivalent visualizations (if provided) for qualitative assessment of incident timelines, remediation actions, and rollbacks.",
+    "",
+    "9. DOCUMENT GUARDRAIL EFFECTS:",
+    "   Optionally, run sensitivity analyses by modifying guardrail strictness in treatment.yaml (e.g., different auto-remediation thresholds) and repeating Steps 6\u20138 to observe the MTTR vs. safety trade-offs.",
+    "",
+    "10. CLEANUP:",
+    "    Stop mock services and orchestrator processes:",
+    "      docker-compose -f docker-compose.ch12.yml down",
+    "      # Or use provided stop script:",
+    "      # ./scripts/stop_ch12_stack.sh"
+  ],
+  "evidence_schema": {
+    "baseline_metrics_record": {
+      "type": "object",
+      "description": "Per-run aggregate metrics for the baseline (manual remediation) condition.",
+      "fields": {
+        "run_id": {
+          "type": "string",
+          "description": "Unique identifier for the experiment run, typically including seed and condition, e.g., 'seed_123_baseline'."
+        },
+        "seed": {
+          "type": "integer",
+          "description": "Random seed used for incident script generation and simulation."
+        },
+        "condition": {
+          "type": "string",
+          "enum": [
+            "baseline"
+          ],
+          "description": "Experimental condition identifier."
+        },
+        "start_time_utc": {
+          "type": "string",
+          "format": "date-time",
+          "description": "UTC timestamp when the simulation run started."
+        },
+        "end_time_utc": {
+          "type": "string",
+          "format": "date-time",
+          "description": "UTC timestamp when the simulation run ended."
+        },
+        "per_incident_metrics": {
+          "type": "array",
+          "items": {
+            "$ref": "#/evidence_schema/incident_metrics_record"
+          },
+          "description": "Array of per-incident metrics and annotations for this run."
+        },
+        "aggregated_metrics": {
+          "type": "object",
+          "properties": {
+            "mttr_minutes_mean": {
+              "type": "number"
+            },
+            "mttr_minutes_median": {
+              "type": "number"
+            },
+            "time_to_first_mitigation_minutes_mean": {
+              "type": "number"
+            },
+            "num_remediations_per_incident_mean": {
+              "type": "number"
+            },
+            "incorrect_remediation_rate": {
+              "type": "number"
+            },
+            "unsafe_change_rate": {
+              "type": "number"
+            },
+            "rollback_rate": {
+              "type": "number"
+            },
+            "incident_recurrence_rate": {
+              "type": "number"
+            },
+            "human_approval_latency_minutes_mean": {
+              "type": "number"
+            },
+            "orchestrator_decision_latency_seconds_mean": {
+              "type": "number"
+            }
+          },
+          "required": [
+            "mttr_minutes_mean",
+            "mttr_minutes_median",
+            "incorrect_remediation_rate",
+            "unsafe_change_rate",
+            "rollback_rate",
+            "incident_recurrence_rate"
+          ]
+        }
+      },
+      "required": [
+        "run_id",
+        "seed",
+        "condition",
+        "start_time_utc",
+        "end_time_utc",
+        "per_incident_metrics",
+        "aggregated_metrics"
+      ]
+    },
+    "treatment_metrics_record": {
+      "type": "object",
+      "description": "Per-run aggregate metrics for the treatment (automated remediation orchestrator) condition.",
+      "fields": {
+        "run_id": {
+          "type": "string",
+          "description": "Unique identifier for the experiment run, e.g., 'seed_123_treatment'."
+        },
+        "seed": {
+          "type": "integer",
+          "description": "Random seed used for incident script generation and simulation."
+        },
+        "condition": {
+          "type": "string",
+          "enum": [
+            "treatment"
+          ],
+          "description": "Experimental condition identifier."
+        },
+        "start_time_utc": {
+          "type": "string",
+          "format": "date-time",
+          "description": "UTC timestamp when the simulation run started."
+        },
+        "end_time_utc": {
+          "type": "string",
+          "format": "date-time",
+          "description": "UTC timestamp when the simulation run ended."
+        },
+        "per_incident_metrics": {
+          "type": "array",
+          "items": {
+            "$ref": "#/evidence_schema/incident_metrics_record"
+          },
+          "description": "Array of per-incident metrics and annotations for this run."
+        },
+        "aggregated_metrics": {
+          "type": "object",
+          "properties": {
+            "mttr_minutes_mean": {
+              "type": "number"
+            },
+            "mttr_minutes_median": {
+              "type": "number"
+            },
+            "time_to_first_mitigation_minutes_mean": {
+              "type": "number"
+            },
+            "num_remediations_per_incident_mean": {
+              "type": "number"
+            },
+            "incorrect_remediation_rate": {
+              "type": "number"
+            },
+            "unsafe_change_rate": {
+              "type": "number"
+            },
+            "rollback_rate": {
+              "type": "number"
+            },
+            "incident_recurrence_rate": {
+              "type": "number"
+            },
+            "human_approval_latency_minutes_mean": {
+              "type": "number"
+            },
+            "orchestrator_decision_latency_seconds_mean": {
+              "type": "number"
+            }
+          },
+          "required": [
+            "mttr_minutes_mean",
+            "mttr_minutes_median",
+            "incorrect_remediation_rate",
+            "unsafe_change_rate",
+            "rollback_rate",
+            "incident_recurrence_rate"
+          ]
+        }
+      },
+      "required": [
+        "run_id",
+        "seed",
+        "condition",
+        "start_time_utc",
+        "end_time_utc",
+        "per_incident_metrics",
+        "aggregated_metrics"
+      ]
+    },
+    "incident_metrics_record": {
+      "type": "object",
+      "description": "Per-incident metrics and annotations used for detailed analysis and post-hoc evaluation.",
+      "fields": {
+        "incident_id": {
+          "type": "string",
+          "description": "Unique identifier for the incident, matching the ID in the incident script and RCA outputs."
+        },
+        "ground_truth": {
+          "type": "object",
+          "properties": {
+            "incident_type": {
+              "type": "string"
+            },
+            "canonical_remediation": {
+              "type": "string"
+            },
+            "severity": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "incident_type",
+            "canonical_remediation"
+          ]
+        },
+        "detection_timestamp": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Timestamp when the incident was detected by the detection pipeline."
+        },
+        "resolution_timestamp": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Timestamp when the incident was considered resolved (SLOs recovered and incident state updated to RESOLVED)."
+        },
+        "mttr_minutes": {
+          "type": "number",
+          "description": "Computed MTTR for this incident."
+        },
+        "time_to_first_mitigation_minutes": {
+          "type": "number",
+          "description": "Time from detection to first mitigating remediation action."
+        },
+        "remediation_actions": {
+          "type": "array",
+          "description": "Ordered list of remediation actions applied during this incident.",
+          "items": {
+            "type": "object",
+            "properties": {
+              "action_id": {
+                "type": "string"
+              },
+              "timestamp": {
+                "type": "string",
+                "format": "date-time"
+              },
+              "source": {
+                "type": "string",
+                "enum": [
+                  "manual",
+                  "orchestrator"
+                ]
+              },
+              "action_type": {
+                "type": "string"
+              },
+              "target": {
+                "type": "string",
+                "description": "e.g., feature flag key, config path, model routing rule ID."
+              },
+              "parameters": {
+                "type": "object"
+              },
+              "risk_level": {
+                "type": "string",
+                "enum": [
+                  "low",
+                  "medium",
+                  "high"
+                ]
+              },
+              "approved_by": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "Human approver identifier, if applicable."
+              },
+              "result": {
+                "type": "string",
+                "enum": [
+                  "success",
+                  "rolled_back",
+                  "failed"
+                ]
+              },
+              "violated_guardrail": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "ID or description of violated guardrail, if any."
+              },
+              "marked_incorrect": {
+                "type": "boolean",
+                "description": "True if this action is later labeled as incorrect remediation."
+              }
+            },
+            "required": [
+              "action_id",
+              "timestamp",
+              "source",
+              "action_type",
+              "target",
+              "risk_level",
+              "result",
+              "marked_incorrect"
+            ]
+          }
+        },
+        "had_incorrect_remediation": {
+          "type": "boolean",
+          "description": "True if any remediation_actions for this incident are marked_incorrect=true."
+        },
+        "had_unsafe_change": {
+          "type": "boolean",
+          "description": "True if any remediation_actions violated at least one guardrail."
+        },
+        "num_rollbacks": {
+          "type": "integer",
+          "description": "Number of remediation actions that resulted in rollbacks."
+        },
+        "recurrence_within_window": {
+          "type": "boolean",
+          "description": "True if a similar incident (same ground_truth.incident_type) recurred within a defined observation window after resolution."
+        },
+        "orchestrator_decision_latency_seconds_mean": {
+          "type": "number",
+          "description": "Mean time from RCA output to orchestrator decision for this incident."
+        },
+        "human_approval_latency_minutes_mean": {
+          "type": "number",
+          "description": "Mean latency for human approvals related to this incident, if applicable."
+        }
+      },
+      "required": [
+        "incident_id",
+        "ground_truth",
+        "detection_timestamp",
+        "resolution_timestamp",
+        "mttr_minutes",
+        "time_to_first_mitigation_minutes",
+        "remediation_actions",
+        "had_incorrect_remediation",
+        "had_unsafe_change",
+        "num_rollbacks",
+        "recurrence_within_window"
+      ]
+    }
+  }
+}

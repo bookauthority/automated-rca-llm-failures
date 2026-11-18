@@ -1,0 +1,481 @@
+{
+  "experiment_id": "exp-06-signal-collection-event-correlation-at-scale-v1",
+  "hypothesis": "A dedicated streaming RCA ingestion and correlation pipeline that (a) normalizes heterogeneous LLM and infra signals into a common event schema, (b) implements explicit correlation keys and temporal windows across requests/sessions/services, and (c) applies controlled sampling and backpressure handling, will: (1) sustain at least 50k LLM interaction events/minute with p95 end-to-end correlation latency under 5 seconds and zero acknowledged-event loss; and (2) produce incident-level correlated contexts with at least 95% of ground-truth-related events attached, when evaluated against a synthetic incident replay benchmark, compared to a baseline batch-oriented pipeline.",
+  "baseline": {
+    "description": "Batch-oriented ingestion and ad-hoc correlation pipeline built with periodic file/log ingestion and offline joins.",
+    "architecture": {
+      "ingestion": "JSONL event files written locally or to object storage (e.g., ./data/events/*.jsonl) by the synthetic workload generator. A batch job (Python script) runs every N minutes to load new files and append events to a columnar store (e.g., DuckDB or Parquet).",
+      "correlation": "Offline correlation step implemented as a separate Python job that executes after each batch load. It performs SQL-like joins across tables (llm_interactions, infra_metrics, traces) keyed on request_id or session_id, plus coarse-grained time windows (e.g., 5-minute buckets).",
+      "event_model": "Events from LLM interactions, infra metrics, and traces are stored in separate logical tables with minimal normalization. Correlation relationships are not materialized until the offline job runs.",
+      "throughput_profile": "Ingestion throughput is limited by batch job cadence and single-process file parsing. There is no explicit backpressure mechanism: if event generation rate exceeds batch processing capacity, ingestion latency grows unbounded.",
+      "sampling": "No adaptive sampling or prioritization; all events from the workload generator are written. If the system falls behind, the design assumes delayed processing, not dropping or downsampling.",
+      "durability": "Durability is provided by the file system or object store. Once files are written, the system relies on periodic discovery and processing. A failure between file write and batch job completion leaves files on disk but correlation latency grows.",
+      "operational_characteristics": [
+        "High end-to-end latency due to batch windows and offline correlation.",
+        "No explicit backpressure or flow control, so overload manifests as unbounded lag.",
+        "Limited utility for near-real-time incident triage because correlated views update only every batch interval."
+      ]
+    },
+    "expected_behavior": {
+      "throughput_and_latency": "Capable of ingesting and correlating up to ~10k LLM interaction events/minute under moderate hardware with batch interval >= 60s, but with p95 correlation latency on the order of the batch interval plus processing time (tens of seconds to minutes).",
+      "correlation_quality": "High correlation completeness when the system is not overloaded because all events within the batch windows are available for joining, but reduced temporal precision and difficulty handling late or out-of-order arrivals.",
+      "failure_modes": [
+        "Growing ingestion lag under spikes.",
+        "Delayed availability of correlated incident views.",
+        "Potential for time-window join errors when clock skew or delayed metrics/traces occur."
+      ]
+    }
+  },
+  "treatment": {
+    "description": "Streaming ingestion and correlation pipeline with explicit RCA event schema, keyed correlation across sources, adaptive sampling, and backpressure-aware processing.",
+    "architecture": {
+      "ingestion": "Events from the synthetic LLM application and infra simulator are pushed into a message broker (e.g., Kafka, Redpanda, or a lightweight in-repo queue abstraction) via an ingestion API (e.g., /ingest HTTP endpoint or direct producer). A streaming consumer normalizes raw events into a unified RCA event schema and writes them to a durable store with low-latency indexing.",
+      "correlation": "A streaming correlator subscribes to normalized events and maintains in-memory and/or state-store-backed correlation state keyed by request_id, session_id, incident_id, and service_name, with tumbling/sliding time windows (e.g., 60\u2013120 seconds) for joining LLM interactions, infra metrics, and traces into incident_context objects.",
+      "event_model": "All events conform to a common RCA schema with fields such as: event_id, event_type, ts, source, request_id, session_id, trace_id, span_id, service_name, model_name, prompt_hash, incident_id (synthetic label for replay), severity, and payload. Source-specific details are nested under payload while top-level keys support efficient correlation.",
+      "throughput_profile": "Designed to sustain at least 50k LLM interaction events/minute plus associated infra metrics/traces, using partitioned topics/queues and parallel consumers. Backpressure is handled via consumer offsets and bounded internal queues.",
+      "sampling": "Implements configurable sampling policies (e.g., keep all events labeled as part of a synthetic incident, probabilistic sampling for healthy traffic) applied at ingestion or normalization. Sampling decisions are recorded in metadata to support accurate interpretation.",
+      "backpressure_handling": "When consumer processing throughput falls behind production, the system: (1) exposes lag metrics; (2) can optionally downgrade to coarser-grained correlation (e.g., fewer context joins) under overload; (3) ensures no acknowledged event is dropped by relying on broker durability.",
+      "durability": "The broker and the normalized-event store provide durability. Every event written and acknowledged by the broker is processed at-least-once by the correlator. Idempotent writes (e.g., using event_id) avoid duplication in the correlated context store.",
+      "operational_characteristics": [
+        "Near-real-time correlation with target p95 latency < 5s from event ingestion to availability of correlated context for active incidents.",
+        "Explicit visibility into lag, throughput, and correlation success rates.",
+        "Graceful degradation under load via backpressure and sampling, while preserving high-fidelity views for incident traffic."
+      ]
+    },
+    "expected_improvements_over_baseline": {
+      "throughput_and_latency": "Sustain >= 50k LLM interaction events/minute with p95 end-to-end correlation latency < 5s, compared to tens of seconds to minutes in the baseline.",
+      "correlation_quality": "Achieve >= 95% coverage of ground-truth incident-related events in the correlated context for synthetic incidents, despite partial data and sampling, versus lower and more variable coverage in the baseline when load spikes or windows misalign.",
+      "operational_resilience": "Maintain bounded lag and controllable degradation modes instead of unbounded backlog growth, with explicit observability into ingestion and correlation performance."
+    }
+  },
+  "workloads": [
+    {
+      "name": "W1-steady-state-mixed-traffic",
+      "description": "A steady-state workload generating a mix of healthy and incident-tagged LLM traffic along with corresponding infra metrics and traces.",
+      "traffic_profile": {
+        "duration_minutes": 30,
+        "llm_rps": {
+          "mean": 30,
+          "distribution": "Poisson",
+          "notes": "Results in ~1,800 LLM requests/minute (~54k over 30 minutes); each LLM request may emit 1\u20133 RCA events (request, response, evaluator signals)."
+        },
+        "incident_mix": {
+          "incident_traffic_fraction": 0.1,
+          "incident_types": [
+            "hallucination_spike",
+            "latency_regression"
+          ],
+          "labeling": "Synthetic incident generator assigns incident_id and incident_type on affected requests and generates correlated infra anomalies (e.g., elevated latency metrics) and trace spans."
+        },
+        "infra_metrics_frequency": "Per-service metrics emitted every 10s per service instance, including latency, error rate, CPU, memory.",
+        "traces": "OpenTelemetry-style spans for each LLM request across gateway, orchestrator, model backend, and vector store."
+      },
+      "purpose": "Measure steady-state throughput, latency, and correlation completeness under realistic mixed traffic without extreme bursts."
+    },
+    {
+      "name": "W2-burst-traffic-with-incident-spike",
+      "description": "A bursty workload with sudden spikes in LLM traffic and incident occurrence, designed to test backpressure handling and sampling behavior.",
+      "traffic_profile": {
+        "duration_minutes": 20,
+        "phases": [
+          {
+            "name": "warmup",
+            "minutes": 5,
+            "llm_rps": 20,
+            "incident_traffic_fraction": 0.05
+          },
+          {
+            "name": "burst-1",
+            "minutes": 5,
+            "llm_rps": 200,
+            "incident_traffic_fraction": 0.3
+          },
+          {
+            "name": "burst-2",
+            "minutes": 5,
+            "llm_rps": 400,
+            "incident_traffic_fraction": 0.4
+          },
+          {
+            "name": "cooldown",
+            "minutes": 5,
+            "llm_rps": 50,
+            "incident_traffic_fraction": 0.1
+          }
+        ],
+        "infra_metrics_frequency": "Per-service metrics emitted every 5s per instance to accentuate correlation load during bursts.",
+        "traces": "Full traces for all incident-related requests; optional sampling (e.g., 20%) for non-incident traffic."
+      },
+      "purpose": "Stress-test ingestion, correlation, backpressure, and sampling policies while ensuring that incident-related correlation remains accurate and timely."
+    },
+    {
+      "name": "W3-synthetic-incident-replay-benchmark",
+      "description": "Deterministic replay of a curated set of historical or pre-recorded synthetic incidents for evaluation, using data shipped in the repo.",
+      "traffic_profile": {
+        "source": "Static event traces stored under repo path (e.g., benchmarks/synthetic_incidents/*.jsonl) including known incidents (hallucination_spike, routing_misconfig, retriever_outage).",
+        "replay_mode": {
+          "type": "time-accurate",
+          "description": "Events are replayed with original inter-event delays to reproduce realistic temporal characteristics.",
+          "alternative": "For speed, an option to compress time (e.g., 10x faster) while preserving event ordering."
+        },
+        "labeling": "Each event is labeled with ground-truth incident_id, incident_type, and is_incident_related boolean for evaluation.",
+        "infra_metrics_and_traces": "Bundled metrics and trace events correlated by request_id, session_id, and timestamps."
+      },
+      "purpose": "Provide a common benchmark across baseline and treatment for measuring correlation completeness, latency, and accuracy against ground truth."
+    }
+  ],
+  "controls": {
+    "configuration_controls": [
+      "Use the same hardware profile (CPU, memory, disk type) and OS/container base image for both baseline and treatment runs.",
+      "Pin dependency versions (Python, libraries, broker, database) via requirements files and/or lock files committed to the repo.",
+      "Use identical synthetic workload seeds (random seeds) and trajectories for baseline and treatment within each workload scenario.",
+      "Disable non-essential background processes and rate-limit external network access to reduce noise in latency measurements."
+    ],
+    "experimental_design": {
+      "pairing": "For each workload (W1\u2013W3), run the baseline and treatment back-to-back on the same environment, then repeat in swapped order (treatment then baseline) to control for warm-cache effects.",
+      "repetitions": 3,
+      "randomization": "Randomize the order of (baseline, treatment) pairs for each repetition of a given workload to reduce systemic bias.",
+      "warmup_and_cooldown": "Discard metrics from an initial warmup window (e.g., first 2 minutes) and final cooldown window (e.g., last 2 minutes) where pipeline components are not in steady state."
+    },
+    "data_controls": [
+      "Ensure that synthetic workload generators preserve the same event distribution and labeling between baseline and treatment, differing only in ingestion/correlation architecture.",
+      "Use fixed incident definitions and ground-truth labels stored as part of the replay datasets; do not mutate or regenerate labels for different runs."
+    ]
+  },
+  "metrics": [
+    {
+      "name": "ingested_events_total",
+      "unit": "count",
+      "description": "Total number of RCA events successfully ingested by the pipeline during a run (per workload), broken down by event_type (llm_interaction, infra_metric, trace_span, evaluator_signal, etc.)."
+    },
+    {
+      "name": "ingestion_throughput",
+      "unit": "events_per_minute",
+      "description": "Average and peak sustained rate at which events are processed from input source (files for baseline, broker for treatment) into the normalized event store."
+    },
+    {
+      "name": "correlation_latency_p50",
+      "unit": "seconds",
+      "description": "Median time from when an event is first produced by the workload generator (generator_ts) to when it is incorporated into a correlated incident_context record (context_ts) accessible to RCA consumers."
+    },
+    {
+      "name": "correlation_latency_p95",
+      "unit": "seconds",
+      "description": "95th percentile of end-to-end correlation latency, same definition as correlation_latency_p50, across all incident-related events."
+    },
+    {
+      "name": "correlation_latency_p99",
+      "unit": "seconds",
+      "description": "99th percentile of end-to-end correlation latency, to capture tail behavior under bursts."
+    },
+    {
+      "name": "correlated_context_completeness",
+      "unit": "dimensionless_fraction",
+      "description": "For each incident_id, the fraction of ground-truth incident-related events that appear in the final correlated context objects produced by the pipeline; aggregated as mean and 5th/95th percentiles across incidents."
+    },
+    {
+      "name": "false_correlation_rate",
+      "unit": "dimensionless_fraction",
+      "description": "Fraction of events attached to a given incident_context that are not labeled as is_incident_related in ground truth (per incident_id), aggregated as mean and percentiles; measures over-correlation/noise."
+    },
+    {
+      "name": "ingestion_lag_p95",
+      "unit": "seconds",
+      "description": "95th percentile delay between event production (generator_ts) and arrival at the ingestion layer (e.g., broker timestamp or file write completion) to control for source-side bottlenecks."
+    },
+    {
+      "name": "pipeline_backlog_max",
+      "unit": "events",
+      "description": "Maximum number of unprocessed events in the ingestion/correlation pipeline (e.g., broker lag or internal queue length) during the run."
+    },
+    {
+      "name": "event_loss_rate",
+      "unit": "dimensionless_fraction",
+      "description": "Fraction of events produced by the workload generator that never appear in either the normalized event store or correlation outputs; computed using generator-side sequence IDs."
+    },
+    {
+      "name": "cpu_utilization_mean",
+      "unit": "percent",
+      "description": "Mean CPU utilization of the primary ingestion and correlation processes for baseline and treatment, as a proxy for resource efficiency."
+    },
+    {
+      "name": "memory_utilization_peak",
+      "unit": "megabytes",
+      "description": "Peak resident memory consumption of the ingestion and correlation processes."
+    },
+    {
+      "name": "sampling_rate_effective",
+      "unit": "dimensionless_fraction",
+      "description": "Effective fraction of non-incident events dropped or downsampled by the sampling policy, to contextualize correlation metrics under load."
+    },
+    {
+      "name": "incident_context_availability_time",
+      "unit": "seconds",
+      "description": "Time from the first event of an incident (min generator_ts for events with incident_id) to the time when a usable incident_context summary is first materialized and queryable."
+    }
+  ],
+  "success_criteria": {
+    "primary": [
+      {
+        "description": "Throughput and latency: Treatment sustains target event rate with low correlation latency.",
+        "criteria": [
+          "For W1 and W2, treatment ingestion_throughput >= 50,000 events_per_minute for at least one 5-minute window without event_loss_rate > 0.",
+          "For all workloads (W1\u2013W3), treatment correlation_latency_p95 <= 5 seconds for incident-related events, after warmup, while baseline correlation_latency_p95 is expected to be significantly higher (e.g., > 30 seconds for batch-based design)."
+        ]
+      },
+      {
+        "description": "Correlation completeness and accuracy: Treatment maintains high coverage of incident-related events without excessive noise.",
+        "criteria": [
+          "For W3 (synthetic replay), treatment correlated_context_completeness >= 0.95 (95%) averaged across all incident_ids.",
+          "For W3, treatment false_correlation_rate <= 0.05 (5%) averaged across incident_ids.",
+          "Treatment correlated_context_completeness is statistically significantly higher than baseline for W2 and W3 (e.g., non-overlapping 95% confidence intervals or pre-specified non-parametric test) under high-load phases."
+        ]
+      }
+    ],
+    "secondary": [
+      {
+        "description": "Operational resilience and efficiency under burst load.",
+        "criteria": [
+          "For W2, treatment pipeline_backlog_max is bounded such that correlation_latency_p95 remains below 2x its steady-state value observed in W1.",
+          "For W2, treatment event_loss_rate == 0 for incident-related events, even if non-incident events are sampled.",
+          "Treatment cpu_utilization_mean and memory_utilization_peak are within acceptable operational limits for the reference hardware (exact thresholds to be defined per environment, but should not exceed 80% CPU and 75% of allocated memory during steady state)."
+        ]
+      }
+    ],
+    "interpretation_notes": [
+      "If treatment meets throughput/latency targets but correlated_context_completeness falls below 95%, sampling, window sizes, and correlation logic must be tuned and the experiment rerun.",
+      "If baseline unexpectedly meets or exceeds treatment on any primary metric, implementation issues or configuration differences must be investigated before drawing conclusions."
+    ]
+  },
+  "failure_modes": [
+    {
+      "name": "Event_loss_due_to_misconfigured_offsets",
+      "description": "Events produced to the broker are not fully consumed by the streaming correlator due to incorrect offset management or consumer group resets.",
+      "detection": "event_loss_rate > 0 with no corresponding errors in ingest/correlator logs; discrepancy between generator total events and normalized store count.",
+      "mitigation": "Enable idempotent writes keyed by event_id, verify exactly-once/at-least-once semantics in tests, and add monitoring on consumer group lag."
+    },
+    {
+      "name": "Correlation_state_bloat",
+      "description": "The correlator retains state for expired sessions or windows, causing memory growth and degraded performance.",
+      "detection": "memory_utilization_peak grows monotonically over the run; correlation_latency_p95 increases with time even under constant load.",
+      "mitigation": "Implement explicit TTLs on correlation state (per request_id/session_id/incident_id) and periodic compaction; verify via unit tests and targeted micro-benchmarks."
+    },
+    {
+      "name": "Misaligned_time_sources",
+      "description": "Clock skew between the workload generator, infra metrics, traces, and ingestion pipeline leads to incorrect correlation windows.",
+      "detection": "High false_correlation_rate and/or low correlated_context_completeness despite zero event_loss_rate; inspection of event timestamps shows significant skew.",
+      "mitigation": "Normalize timestamps at ingestion using a single authoritative clock where possible; encode generator_ts vs received_ts fields and adjust correlation windows accordingly."
+    },
+    {
+      "name": "Unbounded_backlog_under_burst",
+      "description": "During W2 bursts, ingestion exceeds processing capacity and backlog grows without bound, violating latency targets.",
+      "detection": "pipeline_backlog_max exceeds a pre-defined safe threshold and continues to grow; correlation_latency_p99 spikes and does not recover after the burst.",
+      "mitigation": "Tune consumer parallelism, broker partitions, and apply more aggressive sampling on non-incident traffic; introduce admission control for optional signals (evaluator scores, verbose traces)."
+    },
+    {
+      "name": "Sampling_bias_impacting_RCA_usefulness",
+      "description": "Sampling policies reduce ingestion volume but inadvertently drop events critical to reconstruct incidents, lowering correlated_context_completeness.",
+      "detection": "High sampling_rate_effective coincides with low correlated_context_completeness specifically for incidents that span multiple services or longer durations.",
+      "mitigation": "Adjust sampling policies to always retain full context for incident-tagged traffic (by incident_id or severity) and maintain minimum sampling rates for rare-but-important event types."
+    },
+    {
+      "name": "Baseline_over-optimization",
+      "description": "Baseline implementation is tuned with features (e.g., mini-batches with short windows) that make it effectively streaming, confounding the comparison.",
+      "detection": "Baseline correlation_latency_p95 is similar to or better than treatment, and batch interval is very small (e.g., < 5 seconds).",
+      "mitigation": "Explicitly document constraints on baseline (e.g., batch every >= 60 seconds, no streaming queue) in code and configuration; treat any deviation as out-of-scope for this experiment."
+    }
+  ],
+  "required_environment": {
+    "hardware": {
+      "cpu": "At least 8 vCPUs (or equivalent physical cores) per experiment runner.",
+      "memory_gb": 16,
+      "storage": "100 GB SSD or NVMe with throughput >= 200 MB/s and low latency.",
+      "network": "If using a distributed broker/database, intra-cluster bandwidth >= 1 Gbps; latency < 2 ms within cluster."
+    },
+    "software": {
+      "os": "Linux (e.g., Ubuntu 22.04) or equivalent container base image.",
+      "python": "Python 3.10+ with dependencies pinned via requirements.txt or poetry.lock in the repo.",
+      "broker": "Kafka/Redpanda or an in-repo pluggable message queue implementation; baseline may operate without a broker (file-based).",
+      "database_or_store": "DuckDB, PostgreSQL, or another supported store defined in the repo for normalized and correlated event storage.",
+      "observability": "Optional: Prometheus/Grafana stack or lightweight metrics exporter for collecting system-level metrics; otherwise internal logging to JSON files."
+    },
+    "repository_layout": {
+      "root": "https://github.com/bookauthority/automated-rca-llm-failures",
+      "paths": {
+        "workloads": "experiments/ch06_signal_collection/workloads/",
+        "baseline_pipeline": "experiments/ch06_signal_collection/baseline_pipeline/",
+        "treatment_pipeline": "experiments/ch06_signal_collection/streaming_pipeline/",
+        "benchmarks": "experiments/ch06_signal_collection/benchmarks/synthetic_incidents/",
+        "configs": "experiments/ch06_signal_collection/config/",
+        "results": "experiments/ch06_signal_collection/results/"
+      }
+    },
+    "configuration": {
+      "seeds": "Use fixed random seeds for workload generators; store them in a config file (e.g., config/seeds.yaml).",
+      "run_profiles": "Provide separate YAML/JSON configs for W1, W2, and W3, each specifying RPS, duration, incident mix, and replay mode.",
+      "resource_limits": "Optionally use container-level CPU/memory limits to enforce repeatable resource constraints across runs."
+    }
+  },
+  "run_instructions": [
+    "Clone the repository and install dependencies:",
+    "  git clone https://github.com/bookauthority/automated-rca-llm-failures.git",
+    "  cd automated-rca-llm-failures",
+    "  python -m venv .venv && source .venv/bin/activate",
+    "  pip install -r experiments/ch06_signal_collection/requirements.txt",
+    "Start required infrastructure components (if not using in-process mocks), e.g., via Docker Compose:",
+    "  cd experiments/ch06_signal_collection",
+    "  docker compose up -d",
+    "Verify connectivity to broker and database using provided health-check script:",
+    "  python tools/check_env.py --config config/env_default.yaml",
+    "Generate or validate synthetic incident benchmark data (if not already present):",
+    "  python workloads/generate_synthetic_incidents.py \\",
+    "    --output benchmarks/synthetic_incidents/ \\",
+    "    --config config/synthetic_incidents.yaml",
+    "Run the baseline pipeline for each workload:",
+    "  # W1 steady state",
+    "  python baseline_pipeline/run_baseline.py \\",
+    "    --workload-config workloads/w1_steady_state.yaml \\",
+    "    --output-dir results/baseline/w1_run1",
+    "  # W2 burst",
+    "  python baseline_pipeline/run_baseline.py \\",
+    "    --workload-config workloads/w2_burst.yaml \\",
+    "    --output-dir results/baseline/w2_run1",
+    "  # W3 replay",
+    "  python baseline_pipeline/run_baseline.py \\",
+    "    --workload-config workloads/w3_replay.yaml \\",
+    "    --output-dir results/baseline/w3_run1",
+    "Repeat baseline runs for the desired number of repetitions (e.g., 3), randomizing run order as described in controls. Use distinct output directories per run.",
+    "Run the treatment (streaming) pipeline for each workload:",
+    "  # W1 steady state",
+    "  python streaming_pipeline/run_streaming.py \\",
+    "    --workload-config workloads/w1_steady_state.yaml \\",
+    "    --pipeline-config config/streaming_default.yaml \\",
+    "    --output-dir results/treatment/w1_run1",
+    "  # W2 burst",
+    "  python streaming_pipeline/run_streaming.py \\",
+    "    --workload-config workloads/w2_burst.yaml \\",
+    "    --pipeline-config config/streaming_default.yaml \\",
+    "    --output-dir results/treatment/w2_run1",
+    "  # W3 replay",
+    "  python streaming_pipeline/run_streaming.py \\",
+    "    --workload-config workloads/w3_replay.yaml \\",
+    "    --pipeline-config config/streaming_default.yaml \\",
+    "    --output-dir results/treatment/w3_run1",
+    "Ensure warmup and cooldown windows are configured (either via flags or config) so that reported metrics exclude non-steady-state periods.",
+    "After each run, compute experiment metrics by invoking the analysis script, which compares generator logs, normalized events, and correlated outputs:",
+    "  python analysis/compute_metrics.py \\",
+    "    --run-dir results/baseline/w1_run1 \\",
+    "    --ground-truth benchmarks/synthetic_incidents/ \\",
+    "    --output results/baseline/w1_run1_metrics.json",
+    "  python analysis/compute_metrics.py \\",
+    "    --run-dir results/treatment/w1_run1 \\",
+    "    --ground-truth benchmarks/synthetic_incidents/ \\",
+    "    --output results/treatment/w1_run1_metrics.json",
+    "Aggregate metrics across repetitions and workloads to produce summary tables and plots:",
+    "  python analysis/aggregate_results.py \\",
+    "    --input-root results/ \\",
+    "    --output results/summary_ch06.json",
+    "Inspect aggregated metrics to evaluate success_criteria. Document any deviations, suspected causes (e.g., misconfiguration, environment constraints), and rerun experiments if necessary after adjustments."
+  ],
+  "evidence_schema": {
+    "run_metadata": {
+      "run_id": "string (unique identifier for a single pipeline + workload execution, e.g., 'baseline_w1_run1')",
+      "pipeline_type": "string ('baseline' | 'treatment')",
+      "workload_name": "string ('W1-steady-state-mixed-traffic' | 'W2-burst-traffic-with-incident-spike' | 'W3-synthetic-incident-replay-benchmark')",
+      "start_time_utc": "ISO 8601 timestamp",
+      "end_time_utc": "ISO 8601 timestamp",
+      "git_commit_hash": "string (repo commit for reproducibility)",
+      "config_files": "list of strings (paths to workload and pipeline configs used)",
+      "environment_summary": {
+        "hardware": "JSON object summarizing CPU, memory, storage type, and any container limits",
+        "software": "JSON object summarizing OS, Python version, broker/database versions"
+      }
+    },
+    "generator_logs": {
+      "path": "string (e.g., results/.../generator_events.jsonl)",
+      "schema": {
+        "event_id": "string (globally unique ID)",
+        "generator_ts": "float or ISO 8601 (event creation time at generator)",
+        "event_type": "string ('llm_interaction' | 'infra_metric' | 'trace_span' | 'evaluator_signal' | etc.)",
+        "request_id": "string or null",
+        "session_id": "string or null",
+        "incident_id": "string or null (ground-truth incident for synthetic runs)",
+        "incident_type": "string or null (e.g., 'hallucination_spike', 'latency_regression')",
+        "is_incident_related": "boolean",
+        "service_name": "string or null",
+        "payload": "JSON object with source-specific data"
+      }
+    },
+    "normalized_events_store_export": {
+      "path": "string (e.g., results/.../normalized_events.jsonl or .parquet)",
+      "schema": {
+        "event_id": "string",
+        "received_ts": "float or ISO 8601 (time at ingestion layer)",
+        "normalized_ts": "float or ISO 8601 (time after normalization, if different)",
+        "event_type": "string",
+        "source": "string ('llm_app', 'infra', 'tracing', etc.)",
+        "request_id": "string or null",
+        "session_id": "string or null",
+        "trace_id": "string or null",
+        "span_id": "string or null",
+        "service_name": "string or null",
+        "model_name": "string or null",
+        "incident_id_hint": "string or null (if pipeline infers or propagates incident association)",
+        "payload": "JSON object"
+      }
+    },
+    "correlated_context_export": {
+      "path": "string (e.g., results/.../incident_contexts.jsonl)",
+      "schema": {
+        "context_id": "string (unique ID per correlated context, often matching incident_id for synthetic incidents)",
+        "incident_id": "string or null (pipeline-inferred ID or ground-truth for replay)",
+        "context_type": "string ('incident', 'session', 'request_cluster', etc.)",
+        "created_ts": "float or ISO 8601 (time when context first materialized)",
+        "updated_ts": "float or ISO 8601 (time of last update during the run)",
+        "request_ids": "array of strings",
+        "session_ids": "array of strings",
+        "service_names": "array of strings",
+        "event_ids": "array of strings (all events attached to this context)",
+        "summary": "JSON object (optional) with derived aggregates or LLM-generated summaries"
+      }
+    },
+    "metric_results": {
+      "per_run_metrics": {
+        "path": "string (e.g., results/.../*_metrics.json)",
+        "schema": {
+          "run_id": "string",
+          "pipeline_type": "string",
+          "workload_name": "string",
+          "metrics": {
+            "ingested_events_total": "integer",
+            "ingestion_throughput": "float",
+            "correlation_latency_p50": "float",
+            "correlation_latency_p95": "float",
+            "correlation_latency_p99": "float",
+            "correlated_context_completeness": "float (mean across incidents)",
+            "false_correlation_rate": "float (mean across incidents)",
+            "ingestion_lag_p95": "float",
+            "pipeline_backlog_max": "integer",
+            "event_loss_rate": "float",
+            "cpu_utilization_mean": "float",
+            "memory_utilization_peak": "float",
+            "sampling_rate_effective": "float",
+            "incident_context_availability_time": "float (mean across incidents)"
+          }
+        }
+      },
+      "aggregated_metrics": {
+        "path": "string (e.g., results/summary_ch06.json)",
+        "schema": {
+          "experiment_id": "string",
+          "summary_by_workload_and_pipeline": "object keyed by [workload_name][pipeline_type] with aggregates such as mean, std, and confidence intervals for each metric",
+          "comparison_stats": "object summarizing baseline vs treatment deltas and significance tests for key metrics (correlation_latency_p95, correlated_context_completeness, false_correlation_rate, event_loss_rate)"
+        }
+      }
+    },
+    "logs_and_traces": {
+      "pipeline_logs": "Paths to structured logs for ingestion and correlator processes (e.g., results/.../logs/*.log.json).",
+      "infra_metrics": "Optional Prometheus or other metrics snapshots exported during runs for deeper hardware/resource analysis."
+    }
+  }
+}

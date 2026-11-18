@@ -1,0 +1,656 @@
+{
+  "experiment_id": "exp-07-detect-localize-llm-failures-v1",
+  "hypothesis": "A dedicated, real-time detection and localization service that combines rules, simple statistical anomaly detection, and content-aware LLM-based labeling will (a) detect LLM-specific failures (latency spikes, cost anomalies, hallucinations, policy violations, and prompt regressions) with materially higher recall at comparable or lower false-positive rates than a metrics-only rules baseline, and (b) localize detected anomalies to specific services, prompts, and data sources with higher precision and shorter time-to-localization.",
+  "baseline": {
+    "description": "Metrics-only monitoring and manual log triage.\n\n1) Detection: A set of static, threshold-based alerts over aggregate metrics exposed by the LLM gateway and infrastructure (e.g., p95 latency, error rate, token usage per request). Alerts are defined in Prometheus-style rules or equivalent, with no per-prompt or per-user segmentation and no content-aware evaluation. Example rules:\n- Alert on p95 latency > 2x rolling 7-day average for 10 minutes.\n- Alert on HTTP 5xx > 2% for 5 minutes.\n- Alert on median tokens per request > configured threshold for 10 minutes.\n\n2) Localization: On alert, an engineer manually investigates:\n- High-level dashboards (metrics, logs, traces).\n- Raw interaction logs (requests/responses) via ad-hoc queries.\nThere is no automated mapping from anomalies to specific prompts, services, or data sources; localization quality and time are measured based on what a single on-call engineer, following a written runbook, can achieve.\n\n3) Failure labeling: There is no automated content-aware classification (hallucination, policy violation, prompt regression). Failures are manually labeled (if at all) during incident review.",
+    "detection_capabilities": [
+      "Threshold-based alerts on p95 latency (per service, global only).",
+      "Threshold-based alerts on HTTP 5xx error rates (global and per service if available).",
+      "Threshold-based alerts on average tokens per request (global)."
+    ],
+    "localization_capabilities": [
+      "Manual inspection of service-level metrics and traces.",
+      "Ad-hoc log search using request IDs, user IDs, or time windows.",
+      "No automated mapping from anomalies to prompt templates or data sources."
+    ],
+    "assumptions": [
+      "An existing observability stack is present: Prometheus-compatible metrics, log store (e.g., Elasticsearch or Loki), and a dashboarding tool (e.g., Grafana).",
+      "Standard service-level metrics (latency, error rate, throughput) are already instrumented, but there is no LLM-specific content analysis or structured prompt metadata beyond basic request/response logging.",
+      "On-call engineers follow a written baseline runbook for incident triage, including where to look for logs, metrics, and traces."
+    ]
+  },
+  "treatment": {
+    "description": "An LLM-aware, real-time detection and localization service built using the companion repository, integrating rules, statistical anomaly detection, and model-based detectors, plus automated localization.\n\nKey elements:\n\n1) Detection strategies (7.1, 7.2, 7.3):\n- Rules engine: Prompt-level and route-level rules (e.g., per-prompt latency, error rate, policy_violation flag rate, hallucination_score) expressed in configurable YAML/JSON. Rules operate on structured LLM interaction events ingested from Chapter 5 and 6 pipelines.\n- Statistical anomaly detection: Online detectors (e.g., robust z-score over rolling windows or EWMA-based change detection) for metrics such as per-prompt p95 latency, token usage, tool-failure rates, and evaluator scores.\n- Model-based detectors: Optional simple ML models (e.g., logistic regression or tree-based) trained on historical labeled events to predict anomaly likelihood using features like latency deltas, token ratios, route IDs, prompt version IDs, and evaluator scores.\n\n2) Content-aware failure detection (7.3, 7.4):\n- LLM-based labeling: A configurable LLM judge classifies sampled interaction logs into categories like hallucination, policy_violation, prompt_regression, tool_failure, or normal, using prompt templates stored in the repo.\n- Policy and safety checks: Integration with a safety/policy classifier (can be another LLM or a smaller classifier) that flags content violating enterprise policy categories (e.g., PI leakage, toxicity) using well-defined labels.\n- Prompt regression checks: For prompts with A/B or version metadata, the service compares quality signals (e.g., evaluator scores, user feedback rate, hallucination score) between versions to detect regressions.\n\n3) Localization (7.5):\n- Automated mapping from each detected anomaly or labeled failure instance to:\n  - service_id / component (gateway, router, LLM provider, RAG retriever, tools service);\n  - prompt_template_id and prompt_version;\n  - model_id / route_id;\n  - data_source_id (e.g., index name, collection) when RAG is used;\n  - deployment/environment (prod, staging, canary group).\n- A graph-like mapping or lookup table, implemented as configuration in the repo, which defines relationships between services, routes, prompts, and data sources to support simple blame assignment heuristics.\n\n4) Detection and localization service (7.6):\n- Streaming job or microservice (Python) that consumes the RCA event stream (from Chapter 6), applies detection logic, enriches anomalies with localization information, and writes structured detection events to a detections topic/table.\n- REST/HTTP or gRPC API to query active anomalies and their localization data.\n- Configurable detectors and thresholds via YAML/JSON, stored in the repo.\n\n5) Evaluation experiment (7.7):\n- Controlled failure scenarios are induced using companion repo scripts (latency injections, cost anomalies, hallucination and policy-violation prompting, prompt version regressions, routing misconfigurations, and RAG data corruption).\n- Both the baseline and treatment run simultaneously on the same workload and environment; detection outcomes are logged and compared for detection time, recall, precision, and localization accuracy.\n\nThe treatment system builds directly on prior chapters: it assumes structured LLM interaction events with prompt/model metadata (Chapter 5) and a streaming ingestion pipeline (Chapter 6).",
+    "components": [
+      "Real-time detector service implemented in Python (see `services/detector/`).",
+      "Rules engine with configuration files (e.g., `configs/detectors/rules/*.yaml`).",
+      "Statistical anomaly detectors implemented as streaming operators (e.g., `ewma_change_detector.py`).",
+      "LLM-based labeling worker or job that calls a configured LLM endpoint (e.g., `services/labeler_llm/`).",
+      "Localization module that maintains mapping tables (e.g., `configs/mappings/*`) and attaches localization metadata to detection events.",
+      "Evaluation harness and scripts (e.g., `experiments/ch07_detection_localization/`) to run workloads, inject failures, and collect ground truth labels."
+    ],
+    "detection_capabilities": [
+      "Threshold and rules-based alerts on per-prompt, per-model, and per-route metrics.",
+      "Statistical anomaly detection on latency, token usage, error rates, and quality scores at finer granularity (per prompt, per data source).",
+      "Content-aware classification of hallucinations, policy violations, and prompt regressions via LLM judges and other classifiers."
+    ],
+    "localization_capabilities": [
+      "Automatic association of each anomaly with specific prompts, routes, models, and data sources.",
+      "Identification of likely fault domains (prompt, model, router, tool, retrieval index) based on anomaly patterns and mappings.",
+      "Structured localization output consumable by later RCA and remediation components."
+    ]
+  },
+  "workloads": [
+    {
+      "name": "baseline_normal_workload",
+      "description": "Synthetic but realistic mix of LLM requests representing normal traffic without induced failures. Used to warm up baselines, fit statistical baselines, and estimate false-positive behavior.",
+      "traffic_profile": {
+        "request_rate_rps": 5,
+        "duration_minutes": 30,
+        "request_mix": [
+          {
+            "scenario_id": "qa_rag_simple",
+            "fraction": 0.4,
+            "description": "Question-answering over a stable RAG index with short context."
+          },
+          {
+            "scenario_id": "long_form_generation",
+            "fraction": 0.3,
+            "description": "Long-form content generation (e.g., blog summaries) with higher token usage."
+          },
+          {
+            "scenario_id": "tool_calling_agent",
+            "fraction": 0.2,
+            "description": "Agent using simple tools (e.g., calculator, weather API) with moderate tool call frequency."
+          },
+          {
+            "scenario_id": "policy_sensitive_prompts",
+            "fraction": 0.1,
+            "description": "Prompts near safety/policy boundaries but within acceptable limits."
+          }
+        ]
+      },
+      "data_and_prompts": {
+        "prompt_templates_dir": "prompts/baseline/",
+        "rag_corpora": [
+          {
+            "id": "knowledge_base_v1",
+            "path": "data/rag/knowledge_base_v1/",
+            "description": "Static knowledge base with curated, high-quality documents."
+          }
+        ]
+      },
+      "purpose": [
+        "Fit statistical anomaly detectors (e.g., baselines for latency and token metrics).",
+        "Calibrate rules and thresholds to target an acceptable false-positive rate.",
+        "Measure baseline noise levels for localization signals."
+      ]
+    },
+    {
+      "name": "latency_spike_failure",
+      "description": "Controlled injection of latency spikes localized to a specific service and subset of prompts, to test metric-based and localized detection.",
+      "traffic_profile": {
+        "request_rate_rps": 5,
+        "duration_minutes": 30,
+        "induction_window_minutes": [
+          10,
+          20
+        ],
+        "affected_scenarios": [
+          "qa_rag_simple"
+        ]
+      },
+      "failure_mechanism": {
+        "type": "latency_injection",
+        "implementation_hint": "Add artificial sleep in gateway or model client wrapper for requests routed to `model_id=llm_vA_slow` or `service_id=routing_service` during the induction window.",
+        "target_scope": {
+          "service_id": "llm_gateway",
+          "prompt_template_ids": [
+            "qa_rag_v1"
+          ],
+          "model_ids": [
+            "llm_vA"
+          ]
+        },
+        "expected_effect": {
+          "p95_latency_multiplier": 3.0,
+          "error_rate_delta": 0.0
+        }
+      },
+      "purpose": [
+        "Evaluate how quickly each system detects the latency spike.",
+        "Compare treatment vs. baseline in localizing the spike to specific prompts and models."
+      ]
+    },
+    {
+      "name": "token_cost_anomaly",
+      "description": "Induced increase in average tokens per request and cost-per-request for a subset of prompts, simulating a prompt change that expands context unnecessarily.",
+      "traffic_profile": {
+        "request_rate_rps": 5,
+        "duration_minutes": 30,
+        "induction_window_minutes": [
+          10,
+          25
+        ],
+        "affected_scenarios": [
+          "long_form_generation"
+        ]
+      },
+      "failure_mechanism": {
+        "type": "prompt_change_cost_regression",
+        "implementation_hint": "Swap `long_form_v1` with `long_form_v2_costly` that adds unnecessary detailed instructions and large example blocks, increasing both input and output token counts.",
+        "target_scope": {
+          "prompt_template_ids": [
+            "long_form_v1"
+          ],
+          "new_prompt_template_id": "long_form_v2_costly"
+        },
+        "expected_effect": {
+          "avg_tokens_per_request_multiplier": 2.5,
+          "cost_per_request_multiplier": 2.5,
+          "latency_multiplier": 1.2
+        }
+      },
+      "purpose": [
+        "Assess detection of token and cost anomalies beyond simple latency and error metrics.",
+        "Evaluate whether the treatment pipeline can localize anomalies to specific prompt versions."
+      ]
+    },
+    {
+      "name": "hallucination_spike_failure",
+      "description": "Induce a spike in hallucinations by degrading RAG retrieval quality or bypassing retrieval for a subset of RAG prompts, while surface-form responses still look fluent and non-erroring.",
+      "traffic_profile": {
+        "request_rate_rps": 5,
+        "duration_minutes": 30,
+        "induction_window_minutes": [
+          10,
+          25
+        ],
+        "affected_scenarios": [
+          "qa_rag_simple"
+        ]
+      },
+      "failure_mechanism": {
+        "type": "retrieval_degradation",
+        "implementation_hint": "Switch the retriever to use a corrupted index `knowledge_base_v1_corrupted` or random documents, or reduce top-k from 5 to 1 and add noise during the induction window.",
+        "target_scope": {
+          "rag_index_id": "knowledge_base_v1",
+          "new_rag_index_id": "knowledge_base_v1_corrupted"
+        },
+        "expected_effect": {
+          "hallucination_rate_baseline": 0.05,
+          "hallucination_rate_during_failure": 0.4,
+          "latency_multiplier": 1.0,
+          "error_rate_delta": 0.0
+        }
+      },
+      "ground_truth_generation": {
+        "method": "LLM- and rule-assisted labeling with human spot checks.",
+        "steps": [
+          "Log all questions, retrieved documents, and model answers.",
+          "Use a high-quality LLM judge (configured separately from treatment detector) to label each interaction as hallucination or non-hallucination based on available ground-truth knowledge or retrieval context.",
+          "Supplement with deterministic rules for simple questions where exact answers are known (e.g., numeric facts).",
+          "Randomly sample a subset (e.g., 5-10%) for human verification to estimate labeling accuracy."
+        ]
+      },
+      "purpose": [
+        "Test content-aware detection capabilities for hallucinations where metrics like latency or error rate are normal.",
+        "Compare LLM-based labeling and automatic detection against ground truth for recall and precision."
+      ]
+    },
+    {
+      "name": "policy_violation_burst",
+      "description": "Introduce a burst of policy-violating outputs (e.g., restricted content) by temporarily misconfiguring the safety layer for a subset of prompts.",
+      "traffic_profile": {
+        "request_rate_rps": 5,
+        "duration_minutes": 30,
+        "induction_window_minutes": [
+          5,
+          15
+        ],
+        "affected_scenarios": [
+          "policy_sensitive_prompts"
+        ]
+      },
+      "failure_mechanism": {
+        "type": "safety_layer_bypass",
+        "implementation_hint": "Disable or relax moderation for specific routes or prompts, or inject specially crafted prompts that cause the downstream LLM to output disallowed content while infrastructure metrics look normal.",
+        "target_scope": {
+          "route_ids": [
+            "route_policy_sensitive"
+          ]
+        },
+        "expected_effect": {
+          "policy_violation_rate_baseline": 0.01,
+          "policy_violation_rate_during_failure": 0.3,
+          "latency_multiplier": 1.0,
+          "token_usage_multiplier": 1.0
+        }
+      },
+      "ground_truth_generation": {
+        "method": "Dedicated policy classifier + LLM judge with human-verified subset.",
+        "policy_labels": [
+          "safe",
+          "mild_violation",
+          "severe_violation"
+        ],
+        "steps": [
+          "Run all responses through a policy classifier (LLM-based or rules), independent from treatment detectors, to label violations.",
+          "Define ground truth as responses labeled severe_violation or mild_violation as applicable.",
+          "Manually review a stratified sample to estimate the classifier's error; adjust metrics accordingly if necessary."
+        ]
+      },
+      "purpose": [
+        "Evaluate detection and localization for policy-related failures that traditional SLI-based monitoring often misses.",
+        "Assess whether treatment detects a localized spike on specific prompts/routes versus global noise."
+      ]
+    },
+    {
+      "name": "prompt_regression_version_swap",
+      "description": "Simulate a bad prompt rollout that subtly degrades answer quality for a subgroup of prompts without affecting latency or error rate, mimicking a regression introduced by collaboration between product and prompt teams.",
+      "traffic_profile": {
+        "request_rate_rps": 5,
+        "duration_minutes": 40,
+        "induction_window_minutes": [
+          15,
+          35
+        ],
+        "affected_scenarios": [
+          "qa_rag_simple",
+          "long_form_generation"
+        ]
+      },
+      "failure_mechanism": {
+        "type": "prompt_version_regression",
+        "implementation_hint": "Switch from prompt_template `qa_rag_v1` to `qa_rag_v2_regressed` that uses overly generic instructions or fails to incorporate retrieved context reliably, reducing quality scores.",
+        "target_scope": {
+          "prompt_template_ids": [
+            "qa_rag_v1"
+          ],
+          "new_prompt_template_id": "qa_rag_v2_regressed"
+        },
+        "expected_effect": {
+          "quality_score_baseline": 0.8,
+          "quality_score_during_failure": 0.6,
+          "hallucination_rate_delta": 0.1,
+          "latency_multiplier": 1.0
+        }
+      },
+      "ground_truth_generation": {
+        "method": "LLM judge plus manual labels where ground-truth answers are known.",
+        "metrics": [
+          "answer_correctness_binary",
+          "graded_quality_score_0_1",
+          "hallucination_flag"
+        ],
+        "steps": [
+          "Define question sets with known correct answers or authoritative documents.",
+          "Use an LLM judge to grade responses vs. ground truth.",
+          "For a subset, have humans grade correctness and compare to the judge to estimate label noise."
+        ]
+      },
+      "purpose": [
+        "Evaluate detection of quality regressions independent of infra metrics.",
+        "Measure how well treatment localizes regression to specific prompt versions and routes."
+      ]
+    },
+    {
+      "name": "routing_misconfiguration",
+      "description": "Introduce a routing error where a subset of traffic is sent to a suboptimal or outdated model, causing mixed degradation in latency, cost, and quality for specific routes.",
+      "traffic_profile": {
+        "request_rate_rps": 5,
+        "duration_minutes": 35,
+        "induction_window_minutes": [
+          10,
+          30
+        ],
+        "affected_scenarios": [
+          "qa_rag_simple",
+          "tool_calling_agent"
+        ]
+      },
+      "failure_mechanism": {
+        "type": "route_misconfig",
+        "implementation_hint": "Change router configuration to send some traffic from `llm_vA` to `llm_vB_degraded`, which is slower and slightly lower quality, while keeping service-level metrics within broad global ranges.",
+        "target_scope": {
+          "route_ids": [
+            "default_route"
+          ],
+          "bad_model_id": "llm_vB_degraded"
+        },
+        "expected_effect": {
+          "latency_multiplier_affected": 1.5,
+          "quality_score_drop": 0.1,
+          "cost_per_token_delta": 0.2
+        }
+      },
+      "purpose": [
+        "Test whether the treatment system can attribute anomalies to specific routes/models instead of global metrics.",
+        "Assess localization accuracy in multi-model routing scenarios."
+      ]
+    }
+  ],
+  "controls": {
+    "randomness": [
+      "Set fixed random seeds for synthetic workload generators, where applicable (e.g., `PYTHONHASHSEED`, NumPy/torch random seeds).",
+      "Use deterministic prompt selection within each scenario given a seed, or log all sampled prompts to allow exact replay.",
+      "Disable non-essential adaptive systems (e.g., auto-scaling of models) unless explicitly modeled, or log scaling events to interpret their impact."
+    ],
+    "traffic_and_environment": [
+      "Run baseline and treatment detectors against the same input stream either by:\n  - duplicating the incoming event stream (e.g., Kafka topic) into two logical consumers; or\n  - logging events to storage and replaying them twice, once for each detector configuration.",
+      "Ensure identical traffic patterns, prompt distributions, and failure injection schedules across experimental runs.",
+      "Pin model versions and RAG indices outside of controlled changes specified by the workloads."
+    ],
+    "configuration": [
+      "Document all baseline alert thresholds and detection rules in version-controlled files (e.g., `configs/baseline_alerts/*.yaml`).",
+      "Document treatment detector configurations in `configs/detectors/*.yaml`, with explicit version tags for each experiment run.",
+      "Use environment variables or config files to fix LLM judge models and prompts for labeling; changes require new experiment IDs or config versions."
+    ],
+    "labeling_and_ground_truth": [
+      "For LLM-based judges, freeze the judge model and prompt; do not modify during a series of runs.",
+      "Store all labels (LLM- and human-generated) with explicit versioning and provenance in a structured table (e.g., `labels/ground_truth.parquet`).",
+      "When using LLMs for labeling, periodically sample and manually review labels to estimate error; record label accuracy estimates as metadata."
+    ],
+    "runtime_and_resources": [
+      "Run experiments in a controlled, non-production environment (e.g., dedicated staging cluster) with stable resource quotas.",
+      "Ensure that baseline and treatment detection services have comparable resource allocations to avoid trivial performance discrepancies.",
+      "Synchronize clocks across services or use trace timestamps from a common source to avoid skew when computing detection latency."
+    ],
+    "repeats_and_variance": [
+      "Run each workload with each detector configuration (baseline and treatment) at least N times (e.g., N=3\u20135) to estimate variability in metrics.",
+      "Shuffle the order of workloads across runs to reduce systematic time-of-day effects.",
+      "Log run IDs, timestamps, and relevant environment metadata for each trial."
+    ]
+  },
+  "metrics": [
+    {
+      "name": "detection_recall",
+      "unit": "fraction (0-1)",
+      "description": "Fraction of injected failures (or ground-truth-labeled failure instances) that are successfully detected as anomalies by the system within a specified time window."
+    },
+    {
+      "name": "detection_precision",
+      "unit": "fraction (0-1)",
+      "description": "Fraction of detection events that correspond to real failures (as defined by ground truth labels), across a specified time window."
+    },
+    {
+      "name": "false_positive_rate",
+      "unit": "events per hour",
+      "description": "Number of detection events raised during periods without induced failures or without ground-truth-labeled issues, normalized per hour of traffic."
+    },
+    {
+      "name": "time_to_detection",
+      "unit": "seconds",
+      "description": "Elapsed time between failure injection start (or first ground-truth-labeled failure instance) and the first corresponding detection event for that failure type."
+    },
+    {
+      "name": "localization_precision",
+      "unit": "fraction (0-1)",
+      "description": "For detection events with associated localization (service, prompt, model, data source), the fraction for which the predicted primary fault domain matches the ground-truth domain."
+    },
+    {
+      "name": "time_to_localization",
+      "unit": "seconds",
+      "description": "Elapsed time between failure injection start (or first ground-truth failure instance) and the first correct localization event identifying the main fault domain."
+    },
+    {
+      "name": "hallucination_detection_recall",
+      "unit": "fraction (0-1)",
+      "description": "Recall specific to hallucination events in the hallucination_spike_failure workload, relative to ground-truth hallucination labels."
+    },
+    {
+      "name": "policy_violation_detection_recall",
+      "unit": "fraction (0-1)",
+      "description": "Recall specific to policy-violation events in the policy_violation_burst workload, relative to ground-truth policy labels."
+    },
+    {
+      "name": "prompt_regression_detection_recall",
+      "unit": "fraction (0-1)",
+      "description": "Recall for detecting prompt regressions in the prompt_regression_version_swap workload, measured over prompt-level failure periods."
+    },
+    {
+      "name": "computational_overhead",
+      "unit": "CPU-seconds per 1000 events; GB RAM",
+      "description": "Additional compute resources consumed by the detection/localization pipeline (baseline vs. treatment) per 1000 processed LLM interaction events and steady-state memory usage."
+    },
+    {
+      "name": "labeling_cost",
+      "unit": "USD per 1000 labeled events",
+      "description": "Monetary cost of LLM-based labeling per 1000 events, estimated from provider pricing and token usage."
+    }
+  ],
+  "success_criteria": {
+    "primary": [
+      "For each failure workload (latency_spike_failure, token_cost_anomaly, hallucination_spike_failure, policy_violation_burst, prompt_regression_version_swap, routing_misconfiguration), the treatment system achieves at least 20 percentage points higher detection_recall than the baseline at a false_positive_rate no more than 2x the baseline.",
+      "For hallucination_spike_failure, treatment achieves hallucination_detection_recall >= 0.8 with detection_precision >= 0.7, while the baseline achieves recall <= 0.3 (expected, as it lacks content-aware detection).",
+      "For policy_violation_burst, treatment achieves policy_violation_detection_recall >= 0.8 with detection_precision >= 0.7; baseline recall is expected to be significantly lower or near zero.",
+      "For prompt_regression_version_swap, treatment detects the regression with time_to_detection <= 5 minutes on average and prompt_regression_detection_recall >= 0.7, while baseline recall remains low due to lack of quality signals."
+    ],
+    "localization": [
+      "For all failure workloads combined, treatment achieves localization_precision >= 0.8, and median time_to_localization <= 0.5 * baseline time_to_localization (for cases where baseline localization is defined via manual triage time estimates).",
+      "For routing_misconfiguration and token_cost_anomaly, treatment correctly attributes at least 80% of detected anomalies to the correct route_id or prompt_template_id in ground truth."
+    ],
+    "operational": [
+      "Computational_overhead of treatment detectors, excluding LLM labeling, is less than or equal to 10% of the baseline LLM serving compute cost at the experiment traffic levels.",
+      "Labeling_cost is within a configurable budget (e.g., < $10 per 100k requests) for sampled labeling strategies; sampling rate may be tuned to achieve this without materially degrading detection_recall for content-related failures."
+    ],
+    "interpretation_notes": [
+      "If treatment significantly improves recall and localization_precision but at the expense of an unacceptably high false_positive_rate, this should be documented as a trade-off rather than a hard failure; detector thresholds can be tuned for different operating points.",
+      "Success does not require each metric to be met exactly across all workloads; rather, the experiment should demonstrate clear, statistically meaningful improvement over baseline across most workloads, with documented failure cases."
+    ]
+  },
+  "failure_modes": [
+    {
+      "name": "label_noise_and_bias",
+      "description": "Ground-truth labels produced by LLM judges or automated classifiers may be noisy, biased, or misaligned with human judgment, leading to misestimation of recall and precision.",
+      "mitigations": [
+        "Use independent judge models for labeling (ground truth) and for treatment detection where possible.",
+        "Manually review a stratified sample of labels for each workload to estimate error rates.",
+        "Perform sensitivity analysis where metrics are recomputed assuming plausible label error bounds."
+      ]
+    },
+    {
+      "name": "detector_overfitting_to_synthetic_failures",
+      "description": "Detection rules and models might overfit to specific synthetic failure patterns and not generalize.",
+      "mitigations": [
+        "Design synthetic failures to reflect realistic incident patterns, using knowledge from Chapters 1\u20133.",
+        "Hold out some failure scenarios or parameter settings for final evaluation only.",
+        "Avoid hard-coding detection logic that keys directly on known experiment IDs or timestamps."
+      ]
+    },
+    {
+      "name": "clock_skew_and_timestamp_inaccuracy",
+      "description": "Clock skew between failure injection service, logging, and detection services can distort time_to_detection and time_to_localization measurements.",
+      "mitigations": [
+        "Use a single source of time (e.g., server-generated timestamps when events enter the pipeline) for all time measurements.",
+        "Synchronize clocks using NTP and record offsets; when possible, adjust timestamps to a canonical reference in post-processing."
+      ]
+    },
+    {
+      "name": "resource_contention_or_throttling",
+      "description": "During experiments, unexpected resource contention (CPU, network, LLM API rate limits) may impact latency, detection performance, or labeling throughput.",
+      "mitigations": [
+        "Run experiments in isolation where feasible, or record resource utilization metrics and LLM API quota statuses.",
+        "Throttle workloads to stay within safe resource envelopes; avoid saturating compute for detection or labeling."
+      ]
+    },
+    {
+      "name": "misconfigured_baseline_or_treatment",
+      "description": "Incorrectly tuned thresholds or configuration errors in baseline or treatment detectors may unfairly skew results.",
+      "mitigations": [
+        "Version-control all configs and use automated validation checks before runs.",
+        "Perform calibration runs to tune thresholds for both systems to target comparable false-positive rates.",
+        "Document final thresholds and hyperparameters in the experiment log."
+      ]
+    },
+    {
+      "name": "ground_truth_mismatch_for_localization",
+      "description": "Ambiguity in what constitutes the true fault domain (prompt vs. retrieval index vs. model route) can complicate localization_precision scoring.",
+      "mitigations": [
+        "Define clear labeling guidelines and domain hierarchy (e.g., primary domain = component whose change induced the failure) before experiments.",
+        "For ambiguous cases, label multiple plausible domains and treat predictions matching any of them as partially correct, with separate metrics if needed."
+      ]
+    }
+  ],
+  "required_environment": {
+    "infrastructure": [
+      "Kubernetes cluster or equivalent environment capable of running microservices and batch jobs. Alternatively, a docker-compose-based environment for smaller-scale tests.",
+      "Message bus / streaming system (e.g., Kafka, Redpanda, or a lightweight equivalent such as Redis streams) to transport LLM interaction events and detection outputs.",
+      "Metrics store (e.g., Prometheus-compatible) and log store (e.g., Elasticsearch, OpenSearch, or Loki).",
+      "Object or file storage (e.g., S3-compatible or local filesystem) for experiment artifacts, labels, and configuration snapshots."
+    ],
+    "software_stack": [
+      "Python 3.10+ for detector services, labelers, and experiment harnesses.",
+      "Core Python libraries: `pydantic` or `dataclasses`, `fastapi` or `flask` for APIs, `uvicorn` or `gunicorn`, `numpy`, `pandas`, possibly `scikit-learn` for simple models, and a Kafka client (e.g., `confluent-kafka`).",
+      "Observability libraries: OpenTelemetry SDKs for exporting traces and logs, Prometheus clients for metrics.",
+      "LLM client libraries or HTTP access for: (a) the main LLM(s) serving workload traffic, and (b) judge LLM(s) for labeling.",
+      "Access to the companion repository `https://github.com/bookauthority/automated-rca-llm-failures` checked out locally or available in the environment."
+    ],
+    "services_from_previous_chapters": [
+      "LLM interaction event instrumentation and schema from Chapter 5 (`services/gateway_instrumented/`, `schemas/llm_event.json`).",
+      "Streaming ingestion and correlation pipeline from Chapter 6 (`services/ingestion/`, `services/correlator/`).",
+      "Synthetic workload generator and failure injector utilities (`tools/workload_generator/`, `tools/failure_injector/`)."
+    ],
+    "configuration_and_access": [
+      "Configuration files for baseline monitoring (e.g., `configs/baseline_alerts/`) deployed to the metrics/alerting system.",
+      "Configuration files for treatment detectors and labelers (e.g., `configs/detectors/`, `configs/localization_mappings/`).",
+      "API keys and credentials for external LLM providers used as judges, stored securely (e.g., environment variables or secret manager)."
+    ],
+    "human_resources_for_labeling_and_validation": [
+      "Access to at least one domain-knowledgeable engineer or analyst for spot-checking hallucination and policy labels.",
+      "Agreed labeling guidelines (documented in repo, e.g., `docs/labeling_guidelines.md`)."
+    ]
+  },
+  "run_instructions": [
+    "1. Clone repository and set up environment\n   - Clone the companion repo: `git clone https://github.com/bookauthority/automated-rca-llm-failures`\n   - `cd automated-rca-llm-failures`\n   - Create and activate a Python virtualenv or conda environment.\n   - Install dependencies: `pip install -r requirements.txt` or as specified in `experiments/ch07_detection_localization/requirements.txt`.\n\n2. Start core infrastructure (local or cluster)\n   - For local docker-compose setup (example):\n     - `docker-compose -f infra/docker-compose-minimal.yml up -d` to start Kafka/Redpanda, Prometheus, log store, and supporting services.\n   - For Kubernetes deployment (if used), apply manifests under `infra/k8s/` corresponding to ingestion, correlator, and observability stacks.\n\n3. Deploy or start LLM services and instrumentation\n   - Start the instrumented gateway and mock/model services from Chapter 5 (example):\n     - `make run-gateway` or `python services/gateway_instrumented/main.py`.\n   - Ensure the gateway is configured to emit structured LLM interaction events into the ingestion pipeline (Kafka topic, e.g., `llm_events_raw`).\n   - Confirm events are flowing by running the simple consumer or viewer tool under `tools/event_tail/`.\n\n4. Start ingestion and correlation pipeline (Chapter 6 dependencies)\n   - Run the ingestion service: `python services/ingestion/main.py --config configs/ingestion/default.yml`.\n   - Run the correlation service: `python services/correlator/main.py --config configs/correlator/default.yml`.\n   - Verify that correlated events are written to the expected topic or store (e.g., `llm_events_enriched`).\n\n5. Configure and deploy baseline detection\n   - Load baseline alert rules into your metrics/alerting system (e.g., Prometheus/Grafana) using files from `configs/baseline_alerts/`.\n   - If using a baseline detection microservice instead of built-in alerting, start it with: `python services/detector_baseline/main.py --config configs/detectors_baseline/default.yml`.\n   - Confirm that baseline alerts or detection events are being logged to a separate topic or index (e.g., `baseline_detections`).\n\n6. Configure and deploy treatment detection and localization service\n   - Review and, if necessary, adjust detection and localization config under `configs/detectors/` and `configs/localization_mappings/` for your environment (e.g., service IDs, prompt IDs, route IDs).\n   - Start the treatment detector service: `python services/detector/main.py --config configs/detectors/ch07_treatment.yml`.\n   - Ensure it consumes from the enriched events stream (e.g., `llm_events_enriched`) and produces outputs to `treatment_detections`.\n   - Start LLM-based labeler or judge worker (if run as a separate service):\n     - `python services/labeler_llm/main.py --config configs/labeler/ch07_llm_judge.yml`.\n   - Confirm via logs or metrics that the labeler is processing a sample of events and writing labels to the labeling store or topic (e.g., `llm_event_labels`).\n\n7. Initialize statistical detectors\n   - Run the `baseline_normal_workload` using the workload generator:\n     - `python tools/workload_generator/run_workload.py --config experiments/ch07_detection_localization/workloads/baseline_normal.yml`.\n   - Allow both baseline and treatment detectors to run during this workload, but treat this period as a warm-up/calibration phase.\n   - Persist the fitted baselines or model parameters (if any) produced by the treatment detectors in a versioned path (e.g., `artifacts/ch07/baselines/`).\n\n8. Run controlled failure workloads\n   - For each workload configuration file under `experiments/ch07_detection_localization/workloads/` (e.g., `latency_spike_failure.yml`, `token_cost_anomaly.yml`, etc.):\n     - Start the corresponding failure injector in parallel if required:\n       - `python tools/failure_injector/run_injector.py --config experiments/ch07_detection_localization/injectors/latency_spike_failure.yml`.\n     - Launch the workload generator:\n       - `python tools/workload_generator/run_workload.py --config experiments/ch07_detection_localization/workloads/latency_spike_failure.yml --run-id <unique_id>`.\n   - Repeat each workload N times (e.g., 3\u20135) for both baseline and treatment configurations if they are not run simultaneously; record run IDs and configs.\n   - Ensure that failure injectors log precise start and end times of induced failures and associated scopes (service, prompt, route, index) to a structured file (e.g., `artifacts/ch07/runs/<run-id>/failure_ground_truth.json`).\n\n9. Collect ground truth labels\n   - For hallucination_spike_failure, policy_violation_burst, and prompt_regression_version_swap workloads:\n     - Invoke the labeling pipeline on the recorded event logs:\n       - `python experiments/ch07_detection_localization/label_events.py --workload <name> --run-id <run-id> --config experiments/ch07_detection_localization/labeling.yml`.\n     - Store resulting labels in `artifacts/ch07/labels/<workload>/<run-id>.parquet`.\n   - Conduct manual review and correction for a sample of events following guidelines in `docs/labeling_guidelines.md`.\n\n10. Aggregate detections and compute metrics\n   - Run the experiment analysis script for each run:\n     - `python experiments/ch07_detection_localization/analyze_run.py --run-id <run-id> --config experiments/ch07_detection_localization/analysis.yml`.\n   - This script should:\n     - Join failure injection ground truth, labeling ground truth, baseline detections, and treatment detections using timestamps and correlation IDs.\n     - Compute metrics defined in the `metrics` section for both baseline and treatment, per workload and overall.\n   - Store metric summaries as JSON or CSV under `artifacts/ch07/metrics/<run-id>_summary.json`.\n\n11. Compare baseline vs. treatment\n   - Run the summary comparison script across multiple runs:\n     - `python experiments/ch07_detection_localization/compare_baseline_treatment.py --runs-file experiments/ch07_detection_localization/runs_manifest.yml`.\n   - Inspect aggregated metrics (mean, variance) and statistical tests where appropriate (e.g., t-tests for time_to_detection; bootstrap CIs for recall/precision).\n   - Generate plots or tables summarizing:\n     - detection_recall and detection_precision per workload;\n     - time_to_detection and time_to_localization distributions;\n     - localization_precision by failure type.\n\n12. Document findings\n   - Capture interpretations, trade-offs (e.g., recall vs. false positives vs. cost), and detector configuration details in a run report (e.g., `artifacts/ch07/reports/<timestamp>_report.md`).\n   - Note any environments or workloads where the treatment underperforms baseline, and hypothesize reasons (e.g., label noise, overfitting, misconfiguration)."
+  ],
+  "evidence_schema": {
+    "events": {
+      "llm_interaction_event": {
+        "fields": {
+          "event_id": "string (UUID)",
+          "timestamp": "RFC3339 timestamp",
+          "trace_id": "string (optional, to correlate with infra traces)",
+          "request_id": "string",
+          "user_id": "string (hashed or anonymized)",
+          "session_id": "string (optional)",
+          "service_id": "string (e.g., 'gateway', 'router', 'rag_retriever')",
+          "prompt_template_id": "string",
+          "prompt_version": "string",
+          "model_id": "string",
+          "route_id": "string (optional)",
+          "rag_index_id": "string (optional)",
+          "data_source_ids": "array<string> (optional)",
+          "request_payload": "object (prompt text, parameters; may be redacted or hashed as needed)",
+          "response_payload": "object (text, tool calls, metadata; may be redacted or hashed)",
+          "latency_ms": "number",
+          "tokens_input": "number",
+          "tokens_output": "number",
+          "status_code": "integer (e.g., HTTP status or logical status)",
+          "error_type": "string (optional, application error category)",
+          "environment": "string (e.g., 'staging', 'prod-sim')"
+        }
+      },
+      "failure_injection_event": {
+        "fields": {
+          "injection_id": "string (UUID)",
+          "workload_name": "string",
+          "run_id": "string",
+          "failure_type": "string (e.g., 'latency_injection', 'prompt_version_regression')",
+          "start_time": "RFC3339 timestamp",
+          "end_time": "RFC3339 timestamp",
+          "target_scope": "object (service_id, prompt_template_ids, model_ids, route_ids, rag_index_id, etc.)",
+          "parameters": "object (e.g., latency_multiplier, token_multiplier)",
+          "notes": "string (optional)"
+        }
+      },
+      "label_event": {
+        "fields": {
+          "label_id": "string (UUID)",
+          "event_id": "string (references llm_interaction_event.event_id)",
+          "workload_name": "string",
+          "run_id": "string",
+          "label_source": "string (e.g., 'llm_judge_v1', 'policy_classifier_v2', 'human_annotator')",
+          "label_type": "string (e.g., 'hallucination', 'policy_violation', 'quality_score')",
+          "label_value": "string or number (e.g., 'hallucination', 'none', or a numeric score)",
+          "confidence": "number (0-1, optional)",
+          "created_at": "RFC3339 timestamp",
+          "label_version": "string (for judge prompt/model versioning)"
+        }
+      },
+      "detection_event": {
+        "fields": {
+          "detection_id": "string (UUID)",
+          "event_id": "string (optional: if detection corresponds to a single llm_interaction_event)",
+          "run_id": "string",
+          "workload_name": "string",
+          "detector_system": "string (e.g., 'baseline', 'treatment')",
+          "detector_name": "string (e.g., 'latency_threshold_rule', 'ewma_latency_detector', 'hallucination_llm_labeler')",
+          "detection_time": "RFC3339 timestamp",
+          "anomaly_type": "string (e.g., 'latency_spike', 'token_cost_anomaly', 'hallucination_spike', 'policy_violation_spike', 'prompt_regression', 'routing_misconfig')",
+          "severity": "string or number (e.g., 'warning', 'critical' or numeric score)",
+          "aggregation_scope": "object (e.g., time_window_start, time_window_end, and grouping keys like prompt_template_id, model_id, route_id)",
+          "localization": "object (predicted primary fault domain: service_id, prompt_template_id, prompt_version, model_id, route_id, rag_index_id, environment)",
+          "raw_score": "number (optional anomaly score)",
+          "metadata": "object (optional, additional debug info such as feature values or rule thresholds)"
+        }
+      }
+    },
+    "ground_truth": {
+      "failure_period": {
+        "fields": {
+          "failure_period_id": "string (UUID)",
+          "injection_id": "string (references failure_injection_event.injection_id)",
+          "failure_type": "string",
+          "workload_name": "string",
+          "run_id": "string",
+          "start_time": "RFC3339 timestamp",
+          "end_time": "RFC3339 timestamp",
+          "primary_fault_domain": "object (service_id, prompt_template_id, model_id, route_id, rag_index_id, etc.)",
+          "secondary_fault_domains": "array<object> (optional, for multi-cause scenarios)",
+          "description": "string (narrative description of failure configuration)"
+        }
+      },
+      "event_level_ground_truth": {
+        "fields": {
+          "event_id": "string",
+          "workload_name": "string",
+          "run_id": "string",
+          "is_failure": "boolean",
+          "failure_categories": "array<string> (e.g., ['hallucination', 'policy_violation'])",
+          "correctness_label": "string or number (e.g., 'correct', 'incorrect', or a score 0-1)",
+          "policy_label": "string (e.g., 'safe', 'mild_violation', 'severe_violation')",
+          "quality_score": "number (0-1, optional)",
+          "label_source_summary": "string (e.g., 'llm_judge_v1+human_sample_check')"
+        }
+      }
+    },
+    "metrics_and_summaries": {
+      "run_summary": {
+        "fields": {
+          "run_id": "string",
+          "workload_name": "string",
+          "detector_system": "string ('baseline' or 'treatment')",
+          "metrics": "object (key = metric_name; value = numeric value)",
+          "metric_conf_intervals": "object (optional; key = metric_name; value = [lower, upper])",
+          "num_events": "integer",
+          "num_failure_events": "integer",
+          "num_detection_events": "integer",
+          "config_versions": "object (e.g., baseline_alerts_version, treatment_detector_config_version, labeler_config_version)",
+          "environment_metadata": "object (cluster info, resource limits, model versions)"
+        }
+      },
+      "comparison_summary": {
+        "fields": {
+          "comparison_id": "string (UUID)",
+          "workload_name": "string",
+          "runs_included": "array<string> (list of run_ids)",
+          "baseline_aggregate_metrics": "object (metric_name -> value)",
+          "treatment_aggregate_metrics": "object (metric_name -> value)",
+          "statistical_tests": "object (per metric: test_name, p_value, effect_size, CI)",
+          "notes": "string (interpretation of differences and potential confounders)"
+        }
+      }
+    }
+  }
+}

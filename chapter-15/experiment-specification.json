@@ -1,0 +1,505 @@
+{
+  "experiment_id": "ch15-end-to-end-rca-case-studies-e2e-llm-incidents-v1",
+  "hypothesis": "An end-to-end automated RCA pipeline (collection, detection, AI-assisted hypothesis generation, and automated/assisted remediation) built from the companion repository reduces (a) time-to-detection for LLM incidents, (b) mean time to recover (MTTR), and (c) the rate of incorrect root-cause attributions compared to a baseline of manual, dashboard-driven investigation using the same observability data.",
+  "baseline": {
+    "description": "Manual, dashboard-driven RCA process using standard observability tools without the specialized automated RCA components from the companion repository.",
+    "components": [
+      "Standard metrics/logs/traces collection (e.g., OpenTelemetry, Prometheus, ELK) already integrated with the sample LLM application.",
+      "No dedicated RCA pipeline: incidents are investigated manually by an on-call engineer using dashboards, ad-hoc queries, and log searches.",
+      "No automated hypothesis generation, clustering, or RCA-specific correlation; any correlations are discovered manually.",
+      "Remediation decisions (rollbacks, routing updates, prompt fixes, tool disables) are performed manually via configuration changes or feature flags.",
+      "Incidents are simulated using the same replay workloads as the treatment, but automation-specific services are disabled."
+    ],
+    "process": {
+      "triggering": "A synthetic incident is initiated; only generic alerts (e.g., latency, error-rate, or business KPI alerts) fire.",
+      "investigation": "A single experienced engineer uses pre-built dashboards and ad-hoc queries to identify scope, suspected component, and root cause. They capture steps and timestamps in a structured incident log template.",
+      "remediation": "Engineer applies changes via documented runbooks (routing config change, prompt rollback, data pipeline fix, or tool disable) and confirms recovery via dashboards.",
+      "documentation": "Engineer records final root cause, remediation, and timeline. This documentation is later used as ground truth for correctness and false-diagnosis evaluation."
+    }
+  },
+  "treatment": {
+    "description": "End-to-end automated RCA system built from the companion repository, instrumented into the same sample LLM stack and used to handle the same incident replays.",
+    "components": [
+      "RCA signal ingestion layer wired to the application\u2019s metrics/logs/traces and structured LLM interaction events (from earlier chapters).",
+      "Detection and localization service for LLM-specific failures (hallucination spikes, latency/cost regressions, tool failures) with dedicated alerts.",
+      "AI-assisted hypothesis generation and ranking pipeline that fuses signals from infrastructure, LLM content evaluation, routing decisions, and data/tooling pipelines.",
+      "Incident correlation and clustering to group related anomalous events into coherent incident contexts.",
+      "Remediation orchestration layer that can propose and, when configured, apply changes (e.g., switch routing, rollback prompt/data version, disable a failing tool) with human approval.",
+      "RCA UI or CLI to surface ranked hypotheses, evidence, and suggested actions to on-call engineers."
+    ],
+    "process": {
+      "triggering": "Same synthetic incident replays as in the baseline, but RCA-specific alerts are enabled (e.g., hallucination-rate anomaly, cost/latency regression for a route, spike in tool errors).",
+      "investigation": "On-call engineer primarily uses the RCA UI/CLI and ranked hypotheses. Manual dashboards are allowed only as a secondary source (usage should be noted).",
+      "remediation": "Engineer uses the remediation orchestrator to apply or approve suggested actions when safe; otherwise they follow manual runbooks. All actions are logged as RCA decisions.",
+      "documentation": "RCA system auto-logs hypotheses, selected root cause, evidence, and remediation steps; engineer annotates correctness and fills any missing details in the incident record."
+    }
+  },
+  "workloads": [
+    {
+      "id": "workload-cs1-hallucination-spike-after-data-refresh",
+      "description": "Case Study I (15.2): A RAG-based LLM service experiences a sudden spike in hallucinations shortly after a data refresh job introduces corrupted or incomplete knowledge-base entries.",
+      "traffic_profile": {
+        "pattern": "Mixed read-heavy workload simulating user Q&A across multiple topics with a stable request rate; incident is introduced via a data-refresh replay, not load spikes.",
+        "request_rate_rps": 10,
+        "duration_minutes": 90,
+        "phases": [
+          {
+            "name": "warmup-stable",
+            "duration_minutes": 20,
+            "behavior": "Stable request rate using a curated query set with known correct answers, low baseline hallucination rate."
+          },
+          {
+            "name": "incident-introduction",
+            "duration_minutes": 10,
+            "behavior": "Trigger a data-refresh pipeline job that loads an altered index (missing or corrupted documents) and serve traffic only from the new index; hallucination rate increases sharply."
+          },
+          {
+            "name": "post-incident-steady",
+            "duration_minutes": 60,
+            "behavior": "Maintain same query mix; hallucination rate remains elevated until remediation restores the correct index or adjusts retrieval configuration."
+          }
+        ]
+      },
+      "incident_script": {
+        "root_cause_ground_truth": "Corrupted/incorrectly filtered retrieval index produced by the latest data-refresh job, causing the retriever to return missing/irrelevant supporting documents and triggering hallucinations.",
+        "steps": [
+          "At T0 + 20m, run the `data_refresh_corrupt_index` script from the repo to swap the retrieval index for a corrupted version (e.g., missing 40\u201360% of canonical answers and adding conflicting entries).",
+          "Ensure application routing and model versions remain unchanged to isolate the effect to data/knowledge base.",
+          "Verify via internal checks that retrieval recall has degraded (e.g., recall@k decreases by a predefined threshold)."
+        ],
+        "expected_symptoms": [
+          "Increase in hallucination evaluator scores (LLM or rule-based judges) on affected queries.",
+          "More guardrail or evaluator flags for factual inconsistency.",
+          "Stable latency/cost metrics (no major infra/routing change).",
+          "Retrieval metrics indicating decreased recall/relevance."
+        ]
+      }
+    },
+    {
+      "id": "workload-cs2-latency-and-cost-regressions-routing-misconfig",
+      "description": "Case Study II (15.3): A multi-model routing layer is misconfigured to send a large portion of traffic to a slower, more expensive model variant, causing latency and cost regressions.",
+      "traffic_profile": {
+        "pattern": "Mixed traffic of short and long prompts routed across two or more models with a routing policy based on prompt characteristics.",
+        "request_rate_rps": 15,
+        "duration_minutes": 60,
+        "phases": [
+          {
+            "name": "baseline-routing",
+            "duration_minutes": 15,
+            "behavior": "Routing policy correctly directs most standard traffic to a fast, cheap base model and complex queries to a slower, more capable model; baseline latency and cost are established."
+          },
+          {
+            "name": "misconfiguration-introduction",
+            "duration_minutes": 10,
+            "behavior": "Apply a routing configuration change (e.g., via feature flag or config push) that mistakenly inverts or relaxes the routing rules, sending >70% of traffic to the slow/expensive model."
+          },
+          {
+            "name": "post-change-operation",
+            "duration_minutes": 35,
+            "behavior": "Continue identical traffic profile; monitor for increased p95 latency, token usage, and per-request cost while functional quality remains approximately unchanged."
+          }
+        ]
+      },
+      "incident_script": {
+        "root_cause_ground_truth": "Routing configuration error that shifts most traffic to a slower, higher-cost model without a corresponding increase in quality.",
+        "steps": [
+          "At T0 + 15m, deploy the `bad_routing_config` from the repo (e.g., a YAML/JSON config or feature flag change) to the routing service.",
+          "Confirm via routing logs that the percentage of traffic hitting the slow/expensive model exceeds the predefined threshold (e.g., from 20% to 80%).",
+          "Keep data, prompts, and model versions constant; only routing behavior changes."
+        ],
+        "expected_symptoms": [
+          "Sharp increase in route-level p95/p99 latency and average tokens per request.",
+          "Increased cost per request and total cost over the test window.",
+          "Business KPIs (e.g., user success rate) remain mostly stable, indicating a performance/cost-only regression.",
+          "Routing decision logs show a distribution shift toward the more expensive model."
+        ]
+      }
+    },
+    {
+      "id": "workload-cs3-cascading-failures-broken-tool-integration",
+      "description": "Case Study III (15.4): A tool-based agent workflow experiences cascading failures when a critical external tool (e.g., payments, search, or internal API) starts returning intermittent errors or malformed responses.",
+      "traffic_profile": {
+        "pattern": "User requests that frequently trigger tool calls (e.g., retrieval, external API lookups, or transactional operations) within an LLM-powered agent.",
+        "request_rate_rps": 8,
+        "duration_minutes": 75,
+        "phases": [
+          {
+            "name": "healthy-tools",
+            "duration_minutes": 20,
+            "behavior": "All tools respond within expected latency and error budgets; agent successfully completes most tasks end-to-end."
+          },
+          {
+            "name": "tool-degradation",
+            "duration_minutes": 15,
+            "behavior": "Inject partial failures using the repo\u2019s `flaky_tool` script: elevated error rates (e.g., 30\u201350% 5xx), timeouts, or malformed payloads for a single high-dependency tool."
+          },
+          {
+            "name": "tool-outage",
+            "duration_minutes": 20,
+            "behavior": "Escalate to near-total tool failure for a period (e.g., >90% failure rate, or consistently malformed responses) to simulate a hard dependency outage."
+          },
+          {
+            "name": "recovery-phase",
+            "duration_minutes": 20,
+            "behavior": "Tool behavior returns to normal after remediation; observe whether the agent and application recover gracefully."
+          }
+        ]
+      },
+      "incident_script": {
+        "root_cause_ground_truth": "Integration failure with a single external tool (e.g., misconfigured endpoint, auth token expiry, or API contract change) causing cascading failures in the agent workflow.",
+        "steps": [
+          "At T0 + 20m, run the `tool_flakiness_injector` from the repo against the selected tool endpoint (e.g., via proxy or fault-injection middleware).",
+          "At T0 + 35m, increase the severity to simulate a full outage or complete contract change.",
+          "Keep the core LLM model, prompts, and routing constant to isolate failures to the tool integration layer."
+        ],
+        "expected_symptoms": [
+          "Spike in tool invocation errors (5xx, 4xx, or validation failures) and timeouts.",
+          "Increase in agent-level failures (e.g., incomplete task execution, fallback behavior, or user-visible errors).",
+          "Potential second-order effects such as elevated latency and increased token usage (retries, compensating behavior).",
+          "RCA signals linking user-facing failures to specific tool call traces and error patterns."
+        ]
+      }
+    }
+  ],
+  "controls": {
+    "randomization": {
+      "engineer_assignment": "Use at least two engineers with similar experience levels; randomize assignment of baseline vs. treatment across incidents and participants via a Latin-square design to reduce learning and order effects.",
+      "incident_order": "Randomize the order of the three incident workloads for each participant so that not all participants see incidents in the same sequence.",
+      "role_blinding": "Where practical, participants should not be told whether they are in the 'baseline' or 'treatment' condition; environments should be visually similar except for RCA tooling availability."
+    },
+    "environment_parity": {
+      "identical_app_version": "Use the same application, model versions, prompt templates, and infrastructure configuration for both baseline and treatment runs, differing only in the availability of RCA components.",
+      "identical_traffic": "For each incident scenario, use deterministic replay (fixed seed and request sequence) for both baseline and treatment to ensure identical workloads.",
+      "time_isolation": "Run baseline and treatment experiments in time-separated windows or on separate namespaces/clusters to avoid cross-run interference."
+    },
+    "operator_guidelines": {
+      "training": "Provide all participants with identical, minimal orientation for both environments, focusing on capabilities rather than step-by-step guidance to avoid bias.",
+      "runbooks": "Ensure the same remediation runbooks are available for both conditions; in treatment, the RCA system may suggest which runbook to follow.",
+      "documentation_template": "Use a standard incident template for logging timestamps, suspected and final root causes, steps, and remediation for both baseline and treatment runs."
+    }
+  },
+  "metrics": [
+    {
+      "name": "time_to_detection",
+      "unit": "seconds",
+      "definition": "Elapsed time from the moment the incident condition is programmatically introduced (T_incident_start) to the moment the engineer acknowledges a concrete incident alert or manually records an incident start in the run log."
+    },
+    {
+      "name": "time_to_first_hypothesis",
+      "unit": "seconds",
+      "definition": "Elapsed time from T_incident_start to the time the engineer records the first explicit root-cause hypothesis in the incident log."
+    },
+    {
+      "name": "mttr",
+      "unit": "seconds",
+      "definition": "Mean time to recover: elapsed time from T_incident_start to the moment key service-level indicators return to within a predefined healthy band and the engineer confirms incident resolution."
+    },
+    {
+      "name": "hypothesis_accuracy",
+      "unit": "proportion",
+      "definition": "Fraction of experiments where the final documented root cause matches the ground-truth root cause category and main contributing factor for the incident scenario."
+    },
+    {
+      "name": "false_diagnosis_rate",
+      "unit": "proportion",
+      "definition": "Fraction of experiments where a primary root cause is logged that does not match the ground truth, or where remediation is applied to a non-causal component before correcting the actual root cause."
+    },
+    {
+      "name": "num_hypotheses_considered",
+      "unit": "count",
+      "definition": "Total number of distinct root-cause hypotheses recorded by the engineer or generated and seriously evaluated by the RCA system prior to resolution."
+    },
+    {
+      "name": "investigation_effort",
+      "unit": "person_minutes",
+      "definition": "Total active time an engineer spends on diagnosis and remediation tasks per incident, excluding waiting times when no action is taken."
+    },
+    {
+      "name": "alert_precision",
+      "unit": "proportion",
+      "definition": "For detection alerts fired during incident windows, the fraction that correspond to true incidents (as opposed to noise or unaffected components)."
+    },
+    {
+      "name": "alert_recall",
+      "unit": "proportion",
+      "definition": "Fraction of ground-truth incidents (one per scenario run) that are correctly surfaced by at least one high-priority alert within a predefined detection window."
+    },
+    {
+      "name": "automation_uptake",
+      "unit": "proportion",
+      "definition": "In the treatment condition, fraction of remediation steps executed via the remediation orchestrator (with or without human approval) versus manual direct changes."
+    }
+  ],
+  "success_criteria": {
+    "primary": [
+      {
+        "metric": "mttr",
+        "target": "At least 30% reduction in median MTTR for each incident type (hallucination spike, routing regression, tool failure) in the treatment condition relative to the baseline, measured across all runs."
+      },
+      {
+        "metric": "time_to_detection",
+        "target": "At least 30% reduction in median time-to-detection in the treatment condition compared to baseline for each incident type."
+      },
+      {
+        "metric": "false_diagnosis_rate",
+        "target": "Absolute false-diagnosis rate in the treatment condition is not higher than in the baseline, and ideally reduced by at least 20% relative."
+      }
+    ],
+    "secondary": [
+      {
+        "metric": "hypothesis_accuracy",
+        "target": "Hypothesis accuracy in the treatment condition is >= 0.8 and at least 10 percentage points higher than baseline for at least two of the three incident types."
+      },
+      {
+        "metric": "investigation_effort",
+        "target": "Median investigation effort (person-minutes) is reduced by >= 20% in the treatment condition while meeting or exceeding accuracy targets."
+      },
+      {
+        "metric": "alert_precision",
+        "target": "In the treatment condition, alert precision is >= 0.7 for LLM-specific RCA alerts (hallucination, routing, tool failures)."
+      },
+      {
+        "metric": "alert_recall",
+        "target": "In the treatment condition, alert recall is >= 0.9 across all incident runs."
+      }
+    ],
+    "interpretation_notes": [
+      "If MTTR and time-to-detection improvements are achieved but false_diagnosis_rate increases materially, automation may be overconfident; this should be called out as a key lesson learned (15.7).",
+      "Even if quantitative targets are not met, qualitative improvements such as more structured hypotheses or clearer evidence trails should be documented to inform deployment decisions."
+    ]
+  },
+  "failure_modes": [
+    {
+      "name": "environment_drift_between_runs",
+      "description": "Baseline and treatment runs are not performed on equivalent environments (e.g., different model versions, hardware, or observability setups), invalidating comparisons.",
+      "mitigations": [
+        "Automate environment creation using infrastructure-as-code (e.g., Terraform, Helm charts) pinned to specific versions.",
+        "Validate equivalence by running a pre-experiment smoke test comparing key metrics (latency, error rates) between environments before injecting incidents."
+      ]
+    },
+    {
+      "name": "operator_learning_effects",
+      "description": "Engineers become familiar with specific incident patterns after the first run, biasing subsequent runs and favoring whichever condition is executed later.",
+      "mitigations": [
+        "Randomize the order of baseline and treatment for each incident per participant.",
+        "Use multiple participants and apply a Latin-square assignment of (participant, scenario, condition, order).",
+        "Analyze results both per-run and per-participant to identify and discuss learning effects."
+      ]
+    },
+    {
+      "name": "inconsistent_incident_injection",
+      "description": "Incident injection scripts produce different severities or timing across baseline and treatment runs.",
+      "mitigations": [
+        "Use deterministic seeds and scripted incident triggers with explicit timestamps relative to workload start.",
+        "Log all incident injection parameters and verify them post-run as part of quality checks.",
+        "Run small dry runs for each scenario to confirm consistent behavior before formal measurements."
+      ]
+    },
+    {
+      "name": "ambiguous_ground_truth_root_cause",
+      "description": "Incident scenarios are complex enough that multiple plausible root causes exist, making hypothesis accuracy hard to score objectively.",
+      "mitigations": [
+        "Design each scenario with a single primary, clearly documented root cause and a small number of allowed contributing factors.",
+        "Encode ground truth in machine-readable form in the experiment configuration (e.g., component IDs, change IDs).",
+        "Use a rubric with categorical scoring (correct primary cause, correct contributing factor, wrong cause) for evaluating hypotheses."
+      ]
+    },
+    {
+      "name": "alert_fatigue_and_noise",
+      "description": "Excessive alerts or noisy detectors in the treatment condition may slow down engineers or mask useful RCA signals.",
+      "mitigations": [
+        "Calibrate detectors using pre-experiment calibration runs, ensuring thresholds yield acceptable precision and recall.",
+        "Limit the number of alert types used in this experiment to those directly relevant to the incident scenarios.",
+        "Log and analyze the number of alerts per run to contextualize MTTR and detection metrics."
+      ]
+    },
+    {
+      "name": "over-reliance_on_automation",
+      "description": "Engineers may accept automated RCA hypotheses and remediation suggestions uncritically, leading to fast but incorrect actions.",
+      "mitigations": [
+        "Train participants to treat RCA output as decision support, not ground truth, and to document when they disagree with the system.",
+        "Track when automation-led remediation targets an incorrect component and count these towards the false_diagnosis_rate.",
+        "Include scenario variants where automation suggestions are intentionally pessimistic or incomplete to encourage critical review."
+      ]
+    },
+    {
+      "name": "metric_instrumentation_gaps",
+      "description": "Missing or misconfigured instrumentation for hallucinations, routing, or tool calls prevents RCA components from functioning correctly.",
+      "mitigations": [
+        "Run a pre-experiment instrumentation validation step that replays a small workload and verifies expected signals in the RCA data store.",
+        "Add runtime checks in the experiment harness that fail fast if key signals are missing (e.g., hallucination scores, routing logs, tool call results)."
+      ]
+    }
+  ],
+  "required_environment": {
+    "infrastructure": {
+      "compute": "Kubernetes cluster or equivalent container orchestration environment with at least 3\u20135 nodes (or VM equivalents) sufficient to run the sample LLM stack, RCA services, and load generators.",
+      "networking": "Internal network connectivity between application, RCA services, data stores, and external/mock tools; optional internet access for external LLM APIs, or local models if air-gapped.",
+      "storage": "Persistent storage for logs, traces, metrics, and RCA feature stores (e.g., PostgreSQL, object storage, or a columnar analytics store)."
+    },
+    "software_stack": {
+      "language_runtime": "Python 3.10+ for experiment harnesses and RCA components.",
+      "container_runtime": "Docker or compatible container engine.",
+      "orchestration": "Kubernetes (minikube, kind, or cloud-managed), or docker-compose for simplified local setups.",
+      "observability": [
+        "OpenTelemetry SDKs/instrumentation for the sample services.",
+        "Metrics backend such as Prometheus and a dashboarding tool (Grafana) or similar.",
+        "Log storage such as Elasticsearch, Loki, or file-based logs consumed by the RCA system."
+      ],
+      "rca_system": "Deployment of the companion repository\u2019s RCA components: ingestion, detection/localization, hypothesis generation, remediation orchestrator, and incident replay harness.",
+      "llm_components": [
+        "Access to an LLM endpoint (cloud-hosted or local) used in the examples (or a compatible model with similar APIs).",
+        "RAG components (vector store, retriever) and data-refresh scripts for Case Study I.",
+        "Routing layer with configurable model selection policies for Case Study II.",
+        "Agent framework with pluggable tools for Case Study III."
+      ]
+    },
+    "datasets_and_config": {
+      "hallucination_eval_set": "Curated set of Q&A pairs with ground-truth answers used to detect hallucinations and evaluate incident severity for Case Study I.",
+      "retrieval_corpus_variants": "Healthy and corrupted retrieval indices for Case Study I stored in a reproducible format (e.g., two separate vector stores or index snapshots).",
+      "routing_configs": "Baseline and misconfigured routing policies stored as versioned configuration files (YAML/JSON) for Case Study II.",
+      "tool_endpoints": "Mock or real external tool endpoints with controlled behavior; fault-injection scripts or proxies to produce flaky and outage conditions for Case Study III.",
+      "experiment_config_files": "YAML/JSON definitions for each scenario, including workload parameters, incident timings, and ground-truth annotations."
+    }
+  },
+  "run_instructions": {
+    "prerequisites": [
+      "Clone the companion repository: `git clone https://github.com/bookauthority/automated-rca-llm-failures.git`.",
+      "Ensure Python 3.10+ and Docker (and optionally Kubernetes/minikube) are installed.",
+      "Set environment variables or config files for LLM API access (or start local models as described in the repo).",
+      "Install required Python dependencies via `pip install -r requirements.txt` or the equivalent per the repo instructions."
+    ],
+    "setup_steps": [
+      "Navigate to the `experiments/ch15_e2e_case_studies/` directory in the repository.",
+      "Deploy the base LLM application stack using the provided scripts (e.g., `make deploy-app` or `kubectl apply -f k8s/app/`).",
+      "Deploy observability components (metrics, logs, traces) and confirm basic telemetry is flowing (e.g., via Grafana dashboards or CLI tools).",
+      "Deploy the RCA stack (ingestion, detection, hypothesis generation, remediation) using the provided manifests (e.g., `make deploy-rca` or `kubectl apply -f k8s/rca/`).",
+      "Run the instrumentation validation script (e.g., `python validate_instrumentation.py`) to ensure hallucination scores, routing logs, and tool traces are correctly captured.",
+      "Prepare or verify the scenario assets: healthy/corrupted retrieval indices, routing configs, and tool fault-injection scripts according to the README in `experiments/ch15_e2e_case_studies/assets/`."
+    ],
+    "execution_steps": [
+      "For each incident scenario (hallucination spike, routing regression, tool failure), and for each condition (baseline, treatment):",
+      "1. Select participant and assign condition and scenario order according to your Latin-square or randomization plan.",
+      "2. Start the appropriate environment:",
+      "   - Baseline: Deploy the application stack without RCA services, or run the stack with RCA components disabled via config flags.",
+      "   - Treatment: Deploy the full stack including all RCA components and ensure alerts and remediation orchestrator are enabled.",
+      "3. Start the workload generator using the scenario-specific script, for example:",
+      "   - `python run_workload.py --scenario cs1_hallucination_spike --config configs/cs1_baseline.yaml`",
+      "   - Use the same workload configuration for both baseline and treatment (only the `--env` or similar flag differs).",
+      "4. At the configured incident injection time (or automatically via the harness), trigger the incident script:",
+      "   - Case Study I: `python inject_incident.py --scenario cs1_hallucination_spike --mode corrupt_index`",
+      "   - Case Study II: `python inject_incident.py --scenario cs2_routing_regression --mode bad_routing_config`",
+      "   - Case Study III: `python inject_incident.py --scenario cs3_tool_failure --mode flaky_then_outage`",
+      "5. Instruct the participant to respond as if on-call, following the condition-specific investigation process:",
+      "   - Baseline: Use only standard dashboards/logs plus runbooks.",
+      "   - Treatment: Use the RCA UI/CLI, alerts, and remediation orchestrator as the primary tools, with dashboards as secondary.",
+      "6. Throughout the incident, the participant should:",
+      "   - Record timestamps when they notice an issue, when they formulate each hypothesis, and when they apply remediation.",
+      "   - Mark which hypotheses they consider and which they accept as the final root cause.",
+      "   - Record each remediation action (including automated ones) and its effect.",
+      "7. Let the workload run until recovery is confirmed and at least several minutes of post-recovery data are collected for metric computation.",
+      "8. Stop the workload and export experiment logs via the provided script, for example:",
+      "   - `python export_evidence.py --scenario cs1_hallucination_spike --run_id <RUN_ID>`",
+      "9. Repeat for all assigned scenarios and conditions, ensuring randomization and environment reset between runs."
+    ],
+    "post_run_steps": [
+      "Run the analysis script (e.g., `python analyze_runs.py --config analysis/ch15_config.yaml`) to compute metrics such as time_to_detection, mttr, hypothesis_accuracy, and false_diagnosis_rate for each run.",
+      "Inspect the generated reports (CSV/JSON summaries, plots) for each scenario and condition; store them under `experiments/ch15_e2e_case_studies/results/`.",
+      "Review qualitative logs (hypotheses history, RCA suggestions, engineer notes) to extract lessons learned and observed anti-patterns, feeding into section 15.7.",
+      "Optionally, iterate on RCA configurations (e.g., alert thresholds, hypothesis prompts) and re-run experiments to observe how tuning affects outcomes."
+    ]
+  },
+  "evidence_schema": {
+    "run_metadata": {
+      "run_id": "string (unique identifier for an individual experiment run)",
+      "timestamp_start": "ISO 8601 datetime for workload start",
+      "timestamp_incident_injected": "ISO 8601 datetime at which the incident script executed",
+      "timestamp_detection": "ISO 8601 datetime when engineer or system first recognized the incident",
+      "timestamp_first_hypothesis": "ISO 8601 datetime when the first root-cause hypothesis was recorded",
+      "timestamp_recovery_confirmed": "ISO 8601 datetime when the system was considered recovered",
+      "scenario_id": "string (e.g., workload-cs1-hallucination-spike-after-data-refresh)",
+      "condition": "string enum ['baseline', 'treatment']",
+      "participant_id": "string (pseudonymous identifier for the on-call engineer)",
+      "environment_version": "string (git commit hash, container image tag, or configuration version)",
+      "notes": "string (free-text notes about anomalies or deviations from protocol)"
+    },
+    "incident_ground_truth": {
+      "root_cause_primary": "string (canonical component or factor, e.g., 'corrupted_retrieval_index', 'routing_misconfig', 'tool_auth_failure')",
+      "root_cause_contributing": "array of strings (optional secondary factors, e.g., 'missing_alert', 'insufficient_retry_policy')",
+      "incident_type": "string enum ['hallucination_spike', 'latency_cost_regression', 'tool_cascade_failure']"
+    },
+    "rca_outputs": {
+      "hypotheses": [
+        {
+          "hypothesis_id": "string",
+          "timestamp": "ISO 8601 datetime when the hypothesis was first proposed",
+          "source": "string enum ['engineer', 'rca_system']",
+          "description": "string (natural language description of suspected root cause)",
+          "confidence_score": "number (0.0\u20131.0) if generated by RCA system, null if N/A",
+          "status": "string enum ['considered', 'accepted', 'rejected']",
+          "rejection_reason": "string (free-text, optional)"
+        }
+      ],
+      "selected_root_cause": {
+        "hypothesis_id": "string (ID of the accepted hypothesis)",
+        "timestamp_selected": "ISO 8601 datetime when hypothesis was accepted as primary root cause",
+        "matches_ground_truth": "boolean",
+        "match_category": "string enum ['exact_match', 'partial_match', 'mismatch']",
+        "scoring_notes": "string (free-text explanation of scoring decision)"
+      }
+    },
+    "alerts_and_detection": {
+      "alerts": [
+        {
+          "alert_id": "string",
+          "timestamp_fired": "ISO 8601 datetime",
+          "alert_type": "string (e.g., 'hallucination_rate_anomaly', 'latency_regression', 'tool_error_spike')",
+          "severity": "string enum ['low', 'medium', 'high', 'critical']",
+          "is_true_positive": "boolean (does this alert correspond to the injected incident?)",
+          "acknowledged_timestamp": "ISO 8601 datetime when the engineer acknowledged the alert, if applicable"
+        }
+      ],
+      "detection_summary": {
+        "primary_detection_alert_id": "string (ID of the alert most directly associated with detection, if any)",
+        "detection_channel": "string enum ['alert', 'dashboard_observation', 'user_report', 'other']",
+        "detection_notes": "string (free-text context about how incident was first noticed)"
+      }
+    },
+    "remediation_actions": [
+      {
+        "action_id": "string",
+        "timestamp": "ISO 8601 datetime",
+        "initiator": "string enum ['engineer', 'rca_system']",
+        "action_type": "string (e.g., 'rollback_prompt', 'switch_routing_config', 'restore_index_snapshot', 'disable_tool', 'scale_service')",
+        "target_component": "string (identifier of affected service, tool, or configuration)",
+        "automation_level": "string enum ['manual', 'suggested_by_rca', 'auto_applied_with_approval', 'fully_automatic']",
+        "result": "string enum ['success', 'no_effect', 'regression', 'partial_success']",
+        "notes": "string (free-text, including links to logs or dashboards if relevant)"
+      }
+    ],
+    "time_series_metrics": {
+      "sampling_interval_seconds": "number (interval at which metrics are sampled for storage in the experiment logs)",
+      "service_metrics": [
+        {
+          "timestamp": "ISO 8601 datetime",
+          "request_rate_rps": "number",
+          "latency_p50_ms": "number",
+          "latency_p95_ms": "number",
+          "latency_p99_ms": "number",
+          "error_rate": "number (proportion or percentage)",
+          "cost_per_request_usd": "number",
+          "hallucination_rate": "number (proportion of evaluated requests flagged as hallucinations, for applicable scenarios)",
+          "tool_error_rate": "number (proportion of tool invocations failing, for applicable scenarios)"
+        }
+      ],
+      "rca_internal_signals": [
+        {
+          "timestamp": "ISO 8601 datetime",
+          "retrieval_recall_estimate": "number (e.g., recall@k or proxy score; Case Study I)",
+          "routing_distribution": "object mapping model_id:string -> traffic_fraction:number (Case Study II)",
+          "tool_health_scores": "object mapping tool_id:string -> health_score:number (Case Study III)"
+        }
+      ]
+    }
+  }
+}

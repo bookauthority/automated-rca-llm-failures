@@ -1,0 +1,65 @@
+{
+  "type": "object",
+  "properties": {
+    "interaction_id": {"type": "string"},
+    "trace_id": {"type": "string"},
+    "span_id": {"type": "string"},
+    "timestamp": {"type": "string"},
+    "request": {
+      "type": "object",
+      "properties": {
+        "user_id_hash": {"type": "string"},
+        "session_id_hash": {"type": "string"},
+        "prompt_redacted": {"type": "string"},
+        "prompt_tokens": {"type": "integer"},
+        "metadata": {"type": "object"}
+      },
+      "required": ["prompt_redacted"]
+    },
+    "response": {
+      "type": "object",
+      "properties": {
+        "model": {"type": "string"},
+        "completion_redacted": {"type": "string"},
+        "completion_tokens": {"type": "integer"},
+        "latency_ms": {"type": "number"}
+      },
+      "required": ["model", "completion_redacted"]
+    },
+    "routing": {
+      "type": "object",
+      "properties": {
+        "route": {"type": "string"},
+        "model_variant": {"type": "string"}
+      }
+    },
+    "rca_signals": {
+      "type": "object",
+      "properties": {
+        "user_feedback": {
+          "type": "object",
+          "properties": {
+            "score": {"type": "number"},
+            "reason": {"type": "string"}
+          }
+        },
+        "guardrail": {
+          "type": "object",
+          "properties": {
+            "triggered": {"type": "boolean"},
+            "rule_id": {"type": "string"}
+          }
+        },
+        "evaluator_scores": {
+          "type": "object",
+          "properties": {
+            "quality": {"type": "number"},
+            "safety": {"type": "number"}
+          }
+        },
+        "failure_category": {"type": "string"}
+      }
+    }
+  },
+  "required": ["interaction_id", "timestamp", "request", "response"]
+}

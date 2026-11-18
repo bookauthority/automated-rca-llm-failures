@@ -1,0 +1,557 @@
+{
+  "experiment_id": "exp-model-drift-routing-rca-ch10",
+  "hypothesis": "An automated model drift and routing RCA component, integrated with canary/shadow routing and LLM quality evaluators, will (a) detect a bad model rollout (drift and/or routing misconfiguration) within 5 minutes, and (b) correctly attribute at least 90% of detected regressions to the true root cause (model vs. routing vs. upstream/downstream change), while maintaining <5% false-positive rollback recommendations compared to a baseline of metrics-only monitoring without RCA.",
+  "baseline": {
+    "description": "Production-like LLM gateway with multi-model routing using canary releases, but without specialized model drift detection or automated routing RCA. Engineers rely on generic infrastructure metrics (latency, error rate, CPU), token usage, and coarse business metrics displayed in dashboards (e.g., Grafana). No explicit experiment IDs, no per-model quality evaluation, and no automated attribution logic or rollback recommendations.",
+    "components": [
+      "LLM Gateway Service (Python/FastAPI) exposing /chat and /admin endpoints",
+      "Static routing configuration mapping traffic percentages to model versions (e.g., model_v1 stable, model_v2 canary)",
+      "Simple load generator sending requests with randomly sampled tasks/intents",
+      "Metrics collection: latency (p50/p95), error rate, tokens per request, cost per request (estimated), exposed via Prometheus/OpenMetrics",
+      "Dashboards (Grafana or similar) displaying aggregate metrics by route but not attributing regressions to specific causes"
+    ],
+    "routing_behavior": {
+      "strategy": "Weighted random routing",
+      "initial_weights": {
+        "model_v1_stable": 0.9,
+        "model_v2_canary": 0.1
+      },
+      "no_routing_audit_log": true,
+      "no_per_request_experiment_labels": true,
+      "no_shadow_traffic": true
+    },
+    "detection_capabilities": {
+      "drift_detection": "None",
+      "quality_evaluation": "None (no LLM-as-judge or rule-based quality metrics)",
+      "regression_alerts": "Static threshold-based alerts on latency and error rate only, configured at gateway level rather than per-model/per-experiment"
+    }
+  },
+  "treatment": {
+    "description": "Same LLM gateway and routing setup as baseline, augmented with a model drift and routing RCA component that logs routing decisions, tracks per-model/per-experiment cohorts, runs automated quality evaluation on sampled requests, performs statistical regression detection on quality/latency/cost, and automatically attributes detected regressions to model-level drift, routing misconfiguration, or upstream/downstream changes. It emits structured RCA findings and (optionally) posts rollback recommendations via a remediation API.",
+    "components": [
+      "LLM Gateway Service (same as baseline) extended to emit structured events with model_id, model_version, experiment_id, routing_decision, and traffic_mode (control/canary/shadow)",
+      "Routing Decision Logger and Audit Store (e.g., PostgreSQL or SQLite; alternatively, a file-based store for local runs)",
+      "Model Drift and Routing RCA Service implemented in Python, consuming structured events and metrics via a streaming interface (e.g., Kafka) or polling DB/files",
+      "Quality Evaluator: LLM-as-judge or deterministic heuristic evaluator for synthetic tasks, producing scalar quality scores per request",
+      "Experiment Manager providing canary, shadow, and A/B tagging and configuration via YAML in the repo",
+      "Regression Detector computing time-windowed statistics and change-point detection for quality, latency, and cost per request, stratified by model_id and experiment_id",
+      "Attribution Engine applying rules to separate regressions caused by new model versions, routing weight changes, and upstream/downstream changes (e.g., prompt template version changes or RAG toggles)",
+      "RCA Output Sink publishing RCA reports as JSON to a directory, database table, or HTTP endpoint, and optionally exposing a /recommendations endpoint for Chapter 12 integration"
+    ],
+    "routing_behavior": {
+      "strategy": "Weighted random routing with experiment-aware labels",
+      "initial_weights": {
+        "model_v1_stable": 0.9,
+        "model_v2_canary": 0.1
+      },
+      "traffic_modes": [
+        "control",
+        "canary",
+        "shadow"
+      ],
+      "routing_audit_log": true,
+      "per_request_experiment_labels": true,
+      "shadow_traffic_support": true
+    },
+    "detection_capabilities": {
+      "drift_detection": "Statistical comparison of quality metrics and token usage distributions between stable and candidate models over sliding windows",
+      "quality_evaluation": "LLM-as-judge or reference-based heuristic scoring on a labeled synthetic workload; evaluations stored with per-request metadata",
+      "regression_alerts": "Automated, per-model/per-experiment alerts on quality, latency, and cost regressions using relative and absolute thresholds; alerts feed into RCA",
+      "root_cause_attribution": "Rule-based attribution using change logs (model routing/version changes, config changes) and metric patterns to label regressions as model_drift, routing_misconfig, upstream_change, downstream_change, or mixed"
+    }
+  },
+  "workloads": [
+    {
+      "name": "synthetic_eval_workload",
+      "description": "A fixed corpus of synthetic evaluation prompts with deterministic or reference outputs, partitioned into multiple intent/task classes (e.g., factual QA, summarization, classification). Used to measure per-model quality drift and compare stable vs. canary/shadow models.",
+      "generator": "scripts/workloads/generate_synthetic_eval_corpus.py",
+      "size": {
+        "num_prompts": 2000,
+        "num_intent_classes": 4
+      },
+      "request_pattern": {
+        "distribution": "Poisson arrivals approximated via batched requests in a loop",
+        "rate_rps": 5,
+        "duration_minutes": 30,
+        "prompt_selection": "Uniform random over the evaluation corpus with fixed seed for reproducibility"
+      },
+      "labels": {
+        "has_reference_answers": true,
+        "used_for_quality_evaluation": true
+      }
+    },
+    {
+      "name": "synthetic_prod_like_workload",
+      "description": "Higher-volume, partially unlabeled workload mimicking production usage patterns, including variable prompt lengths, temperature settings, and tools disabled. Used primarily for latency and cost regression detection and for testing routing misconfiguration scenarios.",
+      "generator": "scripts/workloads/generate_prod_like_traffic.py",
+      "size": {
+        "num_prompts": 10000,
+        "intent_mix": {
+          "short_qa": 0.4,
+          "long_form": 0.3,
+          "classification": 0.2,
+          "misc": 0.1
+        }
+      },
+      "request_pattern": {
+        "distribution": "Bursty traffic (alternating low and high RPS phases)",
+        "low_phase_rps": 10,
+        "high_phase_rps": 50,
+        "burst_period_seconds": 300,
+        "duration_minutes": 45
+      },
+      "labels": {
+        "has_reference_answers": false,
+        "used_for_latency_cost_evaluation": true
+      }
+    },
+    {
+      "name": "shadow_traffic_replay_workload",
+      "description": "Replay of previously captured anonymized or synthetic request/response logs sent as shadow traffic to a candidate model route, ensuring identical inputs for control and treatment models. Used to test shadow routing decisions and quality drift under real-request distributions.",
+      "generator": "scripts/workloads/replay_shadow_traffic.py",
+      "size": {
+        "num_prompts": 5000
+      },
+      "request_pattern": {
+        "distribution": "Trace-driven replay preserving original inter-arrival gaps (scaled by factor if needed)",
+        "replay_speed_factor": 1.0,
+        "duration_minutes": 30
+      },
+      "labels": {
+        "has_reference_answers": "optional (may be partially labeled)",
+        "used_for_shadow_routing": true
+      }
+    }
+  ],
+  "controls": {
+    "random_seeds": {
+      "routing_seed": 42,
+      "workload_seed": 2024,
+      "evaluation_seed": 7
+    },
+    "environmental_controls": {
+      "hardware": "Fixed VM or container resources (e.g., 4 vCPUs, 16 GB RAM) for gateway and RCA services; stable GPU/LLM backend configuration if using hosted models",
+      "network": "Stable network conditions; if using external LLM APIs, limit experiments to off-peak hours or use recorded responses to avoid confounding variability",
+      "concurrent_processes": "No other heavy workloads on the same host during experiments",
+      "time_sync": "All services use synchronized clocks (e.g., NTP) for accurate time-windowing"
+    },
+    "configuration_controls": {
+      "prompt_templates": "Fixed prompt templates across baseline and treatment; any changes logged via a config change log to distinguish upstream/downstream changes",
+      "model_backends": {
+        "control_model": "model_v1_stable (e.g., local LLM or specific vendor model/version)",
+        "canary_model_good": "model_v2_candidate_good",
+        "canary_model_bad": "model_v3_candidate_bad (simulated drift or regression via wrapper or parameter changes)"
+      },
+      "evaluation_config": "Same evaluator model and evaluation rubric between baseline and treatment where applicable; baseline may not use evaluator outputs for RCA but can log them for offline comparison"
+    },
+    "experimental_design": {
+      "phases": [
+        "Phase 0: Warm-up (10 minutes) with only control model_v1_stable receiving 100% traffic",
+        "Phase 1: Good canary rollout (model_v2_candidate_good at 10\u201320% traffic) with no intentional regressions",
+        "Phase 2: Bad canary rollout (model_v3_candidate_bad at 10\u201320% traffic) inducing quality and/or latency/cost regressions",
+        "Phase 3: Routing misconfiguration scenario (e.g., inverted weights or stale config that sends high-value traffic disproportionately to canary)",
+        "Phase 4: Upstream/downstream change scenario (e.g., prompt template change or RAG toggle) without changing models, to test attribution specificity"
+      ],
+      "baseline_vs_treatment_runs": {
+        "baseline_run": "Gateway + workloads + generic metrics only (RCA components disabled)",
+        "treatment_run": "Gateway + workloads + full RCA stack enabled",
+        "inputs_identical": true,
+        "order": "Randomized or alternated to mitigate temporal drift (e.g., treatment then baseline, or baseline then treatment, documented in run logs)"
+      }
+    }
+  },
+  "metrics": [
+    {
+      "name": "quality_score",
+      "unit": "dimensionless (0\u20131 or 0\u2013100 scale)",
+      "description": "Evaluator-assigned quality score per request, averaged over sliding windows and grouped by model_id, model_version, and experiment_id."
+    },
+    {
+      "name": "quality_regression_delta",
+      "unit": "percentage points",
+      "description": "Difference in mean quality_score between canary/shadow model and stable control within a time window."
+    },
+    {
+      "name": "latency_p50",
+      "unit": "milliseconds",
+      "description": "Median end-to-end request latency per model/experiment."
+    },
+    {
+      "name": "latency_p95",
+      "unit": "milliseconds",
+      "description": "95th percentile end-to-end request latency per model/experiment."
+    },
+    {
+      "name": "cost_per_request",
+      "unit": "USD",
+      "description": "Estimated cost per request based on tokens generated and vendor pricing or simulated pricing."
+    },
+    {
+      "name": "tokens_output",
+      "unit": "tokens",
+      "description": "Number of output tokens per response, used for cost and drift analysis."
+    },
+    {
+      "name": "drift_detection_time",
+      "unit": "seconds",
+      "description": "Time elapsed between the start of a bad rollout (or misconfiguration) and the first correct regression detection event by the RCA component."
+    },
+    {
+      "name": "attribution_accuracy",
+      "unit": "percentage",
+      "description": "Fraction of detected regression episodes for which the RCA component correctly labels the primary root cause (model_drift, routing_misconfig, upstream_change, downstream_change) compared to a ground-truth incident script."
+    },
+    {
+      "name": "false_positive_rate_rollbacks",
+      "unit": "percentage",
+      "description": "Fraction of RCA-generated rollback recommendations that correspond to scenarios where no material regression (above pre-defined thresholds) is present."
+    },
+    {
+      "name": "false_negative_rate_regressions",
+      "unit": "percentage",
+      "description": "Fraction of simulated bad rollout scenarios where a regression is present but not detected above threshold by the RCA system within the observation window."
+    },
+    {
+      "name": "time_to_first_alert",
+      "unit": "seconds",
+      "description": "Time from the onset of a bad rollout or misconfiguration to the first emitted alert or RCA report; measured for both baseline (if any generic alerts) and treatment."
+    },
+    {
+      "name": "rca_processing_overhead",
+      "unit": "milliseconds per request",
+      "description": "Additional per-request processing time introduced by RCA instrumentation (event logging, evaluation sampling) compared to baseline."
+    }
+  ],
+  "success_criteria": {
+    "primary": [
+      {
+        "name": "drift_detection_time",
+        "target": "<= 300 seconds for bad canary rollout scenarios",
+        "interpretation": "The RCA system should detect quality or latency/cost regressions from a bad canary within 5 minutes under the specified workloads."
+      },
+      {
+        "name": "attribution_accuracy",
+        "target": ">= 90%",
+        "interpretation": "At least 90% of regression episodes are correctly attributed to the scripted root cause category across all experimental phases."
+      }
+    ],
+    "secondary": [
+      {
+        "name": "false_positive_rate_rollbacks",
+        "target": "<= 5%",
+        "interpretation": "Fewer than 5% of rollback recommendations are issued in scenarios where regressions do not exceed defined thresholds."
+      },
+      {
+        "name": "false_negative_rate_regressions",
+        "target": "<= 10%",
+        "interpretation": "The RCA system fails to detect no more than 10% of scripted regression episodes within the observation window."
+      },
+      {
+        "name": "rca_processing_overhead",
+        "target": "<= 10 ms per request",
+        "interpretation": "Additional overhead introduced by RCA instrumentation remains operationally acceptable for typical enterprise LLM gateways."
+      }
+    ],
+    "comparison_with_baseline": [
+      {
+        "metric": "time_to_first_alert",
+        "expected_improvement": ">= 2x faster detection for model-related regressions in the treatment compared to baseline metrics-only alerts, where applicable."
+      },
+      {
+        "metric": "attribution_accuracy",
+        "baseline_expectation": "Baseline has no structured attribution or performs manual attribution offline; thus, treatment should provide quantifiable attribution where baseline does not."
+      }
+    ]
+  },
+  "failure_modes": [
+    {
+      "name": "no_regression_detected",
+      "description": "Bad rollback or routing misconfiguration scenarios do not trigger regression detection within the observation window.",
+      "potential_causes": [
+        "Sampling rate for evaluation too low to capture significant signal.",
+        "Thresholds or statistical tests configured too conservatively.",
+        "Workload intensity insufficient to expose regressions."
+      ]
+    },
+    {
+      "name": "misattributed_cause",
+      "description": "RCA system detects a regression but attributes it to the wrong root cause class (e.g., routing_misconfig instead of model_drift).",
+      "potential_causes": [
+        "Incomplete or misaligned change logs for model/routing/config changes.",
+        "Overlapping simultaneous changes (multiple causes within the same time window).",
+        "Heuristic rules that do not fully capture complex interactions between metrics."
+      ]
+    },
+    {
+      "name": "excessive_false_positives",
+      "description": "RCA system generates frequent regression alerts or rollback recommendations during stable or acceptable performance periods.",
+      "potential_causes": [
+        "Thresholds set too aggressively.",
+        "High natural variance in workload metrics not accounted for.",
+        "Insufficient warm-up period leading to unstable baselines."
+      ]
+    },
+    {
+      "name": "high_rca_overhead",
+      "description": "RCA instrumentation significantly increases request latency or resource usage, making it impractical for production.",
+      "potential_causes": [
+        "Synchronous evaluation or logging in the request path.",
+        "Inefficient event serialization or database writes.",
+        "Excessively high sampling of expensive evaluators."
+      ]
+    },
+    {
+      "name": "data_quality_issues",
+      "description": "Missing or corrupted routing metadata, timestamps, or evaluation scores impede drift detection or attribution.",
+      "potential_causes": [
+        "Partial deployment of instrumentation changes.",
+        "Incompatible schema versions across services.",
+        "Backpressure or dropped messages in the ingestion pipeline."
+      ]
+    }
+  ],
+  "required_environment": {
+    "software": [
+      "Python 3.10+",
+      "FastAPI or similar web framework for the LLM Gateway Service",
+      "uvicorn or gunicorn for serving the gateway",
+      "Requests or httpx for load generation scripts",
+      "Pydantic for event schemas",
+      "Pandas and NumPy for metrics aggregation and drift analysis",
+      "SciPy or a lightweight statistical testing library for significance tests (e.g., t-test, Mann-Whitney, KS test)",
+      "Optional: scikit-learn for additional drift metrics (e.g., KL divergence)",
+      "PostgreSQL or SQLite for routing and evaluation logs (SQLite recommended for local reproducibility)",
+      "Optional: Kafka or Redis Streams for streaming ingestion; otherwise, batch polling of DB/file is acceptable",
+      "Docker and Docker Compose (optional but recommended) to provide reproducible services",
+      "Prometheus and Grafana (optional) for baseline metrics dashboards"
+    ],
+    "hardware": {
+      "minimum": "4 vCPUs, 16 GB RAM on the main host or cluster for gateway, RCA service, and database. If using a local LLM, 1 GPU with 16 GB VRAM is recommended; if using external APIs, GPU is not required.",
+      "storage": "At least 5 GB free disk space for logs, evaluation outputs, and metrics snapshots."
+    },
+    "external_dependencies": {
+      "llm_backend": "Either (a) a local open-source LLM model served via an HTTP API, or (b) a vendor LLM API (e.g., OpenAI, Anthropic). The same backend must be used across baseline and treatment.",
+      "evaluator_model": "An LLM used as a judge for evaluation (can be a smaller or cheaper model than the main serving model), or a deterministic reference-based scoring implementation.",
+      "network": "Outbound HTTPS access if vendor APIs are used; otherwise, local loopback for self-hosted models is sufficient."
+    },
+    "repository_layout": {
+      "root": "https://github.com/bookauthority/automated-rca-llm-failures",
+      "paths": {
+        "gateway_service": "services/gateway/",
+        "rca_service": "services/model_drift_routing_rca/",
+        "workloads": "scripts/workloads/",
+        "experiment_configs": "experiments/ch10_model_drift_routing/",
+        "evaluation": "services/evaluator/",
+        "data_outputs": "data/ch10_model_drift_routing/"
+      }
+    }
+  },
+  "run_instructions": [
+    "1. Clone the repository:",
+    "   git clone https://github.com/bookauthority/automated-rca-llm-failures.git",
+    "   cd automated-rca-llm-failures",
+    "",
+    "2. Set up a Python virtual environment and install dependencies:",
+    "   python -m venv .venv",
+    "   source .venv/bin/activate  # On Windows: .venv\\Scripts\\activate",
+    "   pip install -r requirements.txt",
+    "",
+    "3. Configure experiment-specific settings:",
+    "   - Copy the default configuration:",
+    "     cp experiments/ch10_model_drift_routing/config.example.yaml experiments/ch10_model_drift_routing/config.yaml",
+    "   - Edit experiments/ch10_model_drift_routing/config.yaml to select:",
+    "     * LLM backend type (local vs vendor API) and credentials if needed.",
+    "     * Model identifiers for model_v1_stable, model_v2_candidate_good, model_v3_candidate_bad.",
+    "     * Evaluation mode (llm_judge vs reference_heuristic).",
+    "     * Sampling rates for evaluation and RCA (e.g., evaluate 10% of requests).",
+    "     * Phase schedule (start/end times or triggers) for each experimental phase.",
+    "",
+    "4. Initialize the database and any required schemas:",
+    "   python services/model_drift_routing_rca/init_db.py \\",
+    "       --config experiments/ch10_model_drift_routing/config.yaml",
+    "",
+    "5. Start the LLM Gateway Service (baseline/treatment use the same binary):",
+    "   uvicorn services.gateway.main:app --host 0.0.0.0 --port 8000",
+    "",
+    "6. Start the Model Drift and Routing RCA Service (for treatment run only):",
+    "   # In a new terminal with virtualenv activated",
+    "   python services/model_drift_routing_rca/main.py \\",
+    "       --config experiments/ch10_model_drift_routing/config.yaml",
+    "",
+    "7. (Optional) Start Prometheus and Grafana for baseline dashboards using Docker Compose:",
+    "   docker compose -f infra/docker-compose-observability.yaml up",
+    "",
+    "8. Generate the synthetic evaluation corpus (if not pre-generated):",
+    "   python scripts/workloads/generate_synthetic_eval_corpus.py \\",
+    "       --output data/ch10_model_drift_routing/eval_corpus.jsonl \\",
+    "       --seed 2024 \\",
+    "       --num-prompts 2000",
+    "",
+    "9. Run the baseline experiment (no RCA service):",
+    "   - Ensure ONLY the gateway service is running (stop the RCA service if running).",
+    "   - Run the baseline driver script which orchestrates phases and workloads:",
+    "     python experiments/ch10_model_drift_routing/run_baseline.py \\",
+    "         --config experiments/ch10_model_drift_routing/config.yaml \\",
+    "         --eval-corpus data/ch10_model_drift_routing/eval_corpus.jsonl \\",
+    "         --output-dir data/ch10_model_drift_routing/baseline/",
+    "   - This script will:",
+    "     * Execute Phase 0\u20134 according to the schedule.",
+    "     * Send traffic using synthetic_eval_workload and synthetic_prod_like_workload.",
+    "     * Optionally log evaluator outputs for offline comparison.",
+    "     * Record all metrics and events to the baseline output directory.",
+    "",
+    "10. Run the treatment experiment (RCA enabled):",
+    "    - Ensure both gateway and RCA services are running.",
+    "    - Run the treatment driver script:",
+    "      python experiments/ch10_model_drift_routing/run_treatment.py \\",
+    "          --config experiments/ch10_model_drift_routing/config.yaml \\",
+    "          --eval-corpus data/ch10_model_drift_routing/eval_corpus.jsonl \\",
+    "          --output-dir data/ch10_model_drift_routing/treatment/",
+    "    - This script will:",
+    "      * Execute the same Phase 0\u20134 schedule as baseline with identical workloads (controlled via seeds).",
+    "      * Tag each request with experiment_id and traffic_mode (control/canary/shadow).",
+    "      * Trigger evaluator sampling and send events to the RCA service.",
+    "      * Collect RCA outputs (regression detections, attributions, and recommendations).",
+    "",
+    "11. (Optional) Run the shadow traffic replay workload in both baseline and treatment:",
+    "    python scripts/workloads/replay_shadow_traffic.py \\",
+    "        --config experiments/ch10_model_drift_routing/config.yaml \\",
+    "        --trace data/ch10_model_drift_routing/shadow_trace.jsonl \\",
+    "        --output-dir data/ch10_model_drift_routing/{baseline|treatment}/shadow/",
+    "",
+    "12. Analyze experiment results:",
+    "    - Run the analysis script to compute metrics and generate comparison plots:",
+    "      python experiments/ch10_model_drift_routing/analyze_results.py \\",
+    "          --baseline data/ch10_model_drift_routing/baseline/ \\",
+    "          --treatment data/ch10_model_drift_routing/treatment/ \\",
+    "          --output-dir data/ch10_model_drift_routing/analysis/",
+    "    - This script will compute:",
+    "      * quality_score and quality_regression_delta per model/phase.",
+    "      * latency_p50 and latency_p95 per model/phase.",
+    "      * cost_per_request distributions per model/phase.",
+    "      * drift_detection_time and time_to_first_alert for scripted bad rollouts.",
+    "      * attribution_accuracy, false_positive_rate_rollbacks, false_negative_rate_regressions.",
+    "      * rca_processing_overhead compared to baseline.",
+    "",
+    "13. Inspect RCA reports for correctness:",
+    "    - Review JSON RCA reports in data/ch10_model_drift_routing/treatment/rca_reports/.",
+    "    - Verify that for each scripted bad rollout or misconfiguration scenario, the RCA report:",
+    "      * Flags the correct time window.",
+    "      * Identifies the affected model(s) and routing changes.",
+    "      * Attributes the regression to the expected root cause category.",
+    "",
+    "14. Document and version results:",
+    "    - Commit experiment configuration and a summary of analysis outputs to a separate branch or directory (excluding secrets).",
+    "    - Record environment details (software versions, LLM backend configuration) in a README within experiments/ch10_model_drift_routing/",
+    "",
+    "15. To rerun with alternative thresholds or sampling settings:",
+    "    - Update experiments/ch10_model_drift_routing/config.yaml and repeat steps 9\u201313.",
+    "    - Use different run_ids in the output directory to keep runs separate (e.g., baseline_run1, treatment_run1, baseline_run2)."
+  ],
+  "evidence_schema": {
+    "summary": {
+      "description": "High-level textual summary of the experiment run, environment, and whether primary/secondary success criteria were met.",
+      "fields": {
+        "experiment_id": "String identifier for the experiment (e.g., exp-model-drift-routing-rca-ch10).",
+        "run_id": "Unique string for this specific run (e.g., treatment_run1).",
+        "date": "ISO-8601 date/time when the experiment was executed.",
+        "environment": "Short description of environment (local, CI, staging, etc.).",
+        "llm_backend": "Backend used (local model name or vendor API version).",
+        "notes": "Free-text notes about anomalies, deviations from the plan, or configuration changes."
+      }
+    },
+    "configuration_snapshot": {
+      "description": "Snapshot of the key configuration parameters used for the run.",
+      "fields": {
+        "config_file_path": "Path to the YAML config used.",
+        "routing_weights_by_phase": "Map of phase name to routing weights for each model.",
+        "evaluation_sampling_rate": "Fraction of requests evaluated (0\u20131).",
+        "regression_thresholds": "Quality/latency/cost thresholds used for regression detection.",
+        "drift_detection_window": "Time window size in seconds or number of requests for drift statistics.",
+        "change_log": "List of scripted changes (model version changes, routing misconfigurations, prompt/template toggles) with timestamps."
+      }
+    },
+    "metrics_aggregate": {
+      "description": "Aggregated metrics across phases, models, and runs.",
+      "fields": {
+        "per_phase": [
+          {
+            "phase": "Name of the phase (Phase 0\u20134).",
+            "model_id": "e.g., model_v1_stable, model_v2_candidate_good, model_v3_candidate_bad.",
+            "experiment_id": "Experiment label (control, canary_good, canary_bad, shadow).",
+            "mean_quality_score": "Float.",
+            "quality_regression_delta_vs_control": "Float; NA for control.",
+            "latency_p50_ms": "Float.",
+            "latency_p95_ms": "Float.",
+            "mean_cost_per_request_usd": "Float.",
+            "mean_tokens_output": "Float.",
+            "num_requests": "Integer number of requests in this cohort."
+          }
+        ],
+        "overall": {
+          "drift_detection_time_seconds": "Float or null if not detected.",
+          "time_to_first_alert_seconds": "Float or null.",
+          "attribution_accuracy_percent": "Float between 0\u2013100.",
+          "false_positive_rate_rollbacks_percent": "Float between 0\u2013100.",
+          "false_negative_rate_regressions_percent": "Float between 0\u2013100.",
+          "rca_processing_overhead_ms_per_request": "Float difference between treatment and baseline.",
+          "baseline_vs_treatment_alert_time_improvement_factor": "Float representing speedup (baseline_time / treatment_time) if both exist."
+        }
+      }
+    },
+    "rca_events": {
+      "description": "Detailed logs of RCA detections and attributions emitted during the treatment run.",
+      "fields": {
+        "events": [
+          {
+            "event_id": "Unique identifier for the RCA event.",
+            "timestamp": "ISO-8601 UTC timestamp.",
+            "phase": "Phase during which event occurred.",
+            "incident_id": "Logical incident or regression episode ID, used to group related events.",
+            "affected_models": [
+              "List of model identifiers involved in the event."
+            ],
+            "metrics_snapshot": {
+              "quality_score_delta": "Float difference vs. control or historical baseline.",
+              "latency_delta_ms": "Float difference vs. control or baseline.",
+              "cost_delta_usd": "Float difference vs. control or baseline.",
+              "tokens_output_delta": "Float difference vs. baseline."
+            },
+            "detected_regression_types": [
+              "List of regression types (e.g., quality, latency, cost)."
+            ],
+            "attributed_primary_cause": "One of: model_drift, routing_misconfig, upstream_change, downstream_change, mixed, unknown.",
+            "cause_confidence": "Float 0\u20131 representing confidence in the attribution.",
+            "supporting_evidence": {
+              "recent_changes": [
+                "List of change_log entries temporally correlated with the regression."
+              ],
+              "cohort_comparison": "Structured summary comparing affected cohort vs. control cohorts.",
+              "statistical_test_results": [
+                {
+                  "test_name": "Name of statistical test used (e.g., t_test, mann_whitney, ks_test).",
+                  "p_value": "Float p-value.",
+                  "effect_size": "Float effect size or standardized mean difference."
+                }
+              ]
+            },
+            "recommended_actions": [
+              "List of recommended actions (e.g., rollback_canary, adjust_routing_weights, revert_prompt_template, investigate_downstream_service)."
+            ],
+            "action_severity": "Enum: info, warning, critical."
+          }
+        ]
+      }
+    },
+    "raw_data_references": {
+      "description": "Pointers to raw log files, database tables, or trace IDs used in the analysis.",
+      "fields": {
+        "gateway_logs_path": "Path or URI to gateway logs for this run.",
+        "evaluation_logs_path": "Path or URI to evaluation outputs.",
+        "routing_audit_log_path": "Path or URI to routing decision logs.",
+        "rca_reports_path": "Path or URI to RCA JSON reports.",
+        "metrics_export_path": "Path or URI to Prometheus/OpenMetrics export or CSV/Parquet snapshots."
+      }
+    }
+  }
+}

@@ -1,0 +1,622 @@
+{
+  "experiment_id": "chap9-prompt-policy-hallucination-rca-v1",
+  "hypothesis": "A prompt- and content-focused RCA module that (a) versions prompts and templates, (b) evaluates hallucinations with both LLM and non-LLM judges, and (c) explicitly decomposes failures into retrieval vs. model vs. prompt vs. policy layers will: (1) reduce time-to-diagnosis for content-centric incidents by at least 30%, and (2) increase correctly attributed root causes for RAG hallucination and prompt-regression incidents by at least 20 percentage points, compared with a baseline RCA setup that only uses coarse interaction logs and aggregate quality scores.",
+  "baseline": {
+    "description": "RCA pipeline without specialized prompt/content instrumentation or layered hallucination attribution.",
+    "components": [
+      "LLM application: HTTP API endpoint exposing a RAG-backed assistant (e.g., /api/chat) implemented in the repo under `examples/rag_app/`.",
+      "Generic instrumentation only: request/response logs, latency, token counts, error codes, coarse user feedback (thumbs up/down) as implemented in Chapter 5/6 examples (imported here as a dependency).",
+      "Basic quality signal: a single LLM-based evaluator that outputs a scalar `quality_score` (0\u20131) and `hallucination_flag` per response, without access to retrieval context or prompt/template version metadata.",
+      "RCA logic: generic incident clustering and hypothesis generation from Chapter 8, but only using high-level metrics (hallucination rate, latency, traffic spikes) and no explicit modeling of prompt versions, template configuration, or retrieval quality.",
+      "Policy monitoring: surface-level safety filters at the LLM gateway (e.g., OpenAI/Anthropic moderation API, or a simple regex-based filter) with binary allow/block logs but no structured policy category labels or RCA-aware policy configuration metadata."
+    ],
+    "behavior": "When a spike in hallucinations or policy violations occurs, the baseline RCA system can detect elevated hallucination_flag rates and policy_block counts, but cannot reliably distinguish whether the primary contributor is: (a) retrieval degradation, (b) a prompt/template change, (c) a model change, or (d) a policy-layer configuration issue. Investigation relies on manual log inspection and intuition rather than structured content-aware root cause factors."
+  },
+  "treatment": {
+    "description": "Enhanced RCA pipeline with explicit prompt/template instrumentation, layered hallucination evaluation, and structured attribution of failures to retrieval vs. model vs. prompt vs. policy layers.",
+    "components": [
+      "Prompt and template instrumentation (Section 9.1):",
+      "  - Prompt/template registry module in `rca/prompt_registry/` with:",
+      "    - Stable `prompt_template_id` and `prompt_template_version` fields.",
+      "    - Template metadata: `intent`, `task_type`, `safety_profile`, `owner_team`, ` rollout_strategy`.",
+      "    - Change log capturing diffs between versions (stored as JSON patch or text diff).",
+      "  - Runtime injection of prompt metadata into the LLM interaction event schema from Chapter 5 via middleware (e.g., FastAPI/Flask middleware in `examples/rag_app/middleware/prompt_metadata.py`).",
+      "Prompt regression and template misconfiguration detection (Section 9.2):",
+      "  - A `prompt_regression_detector` service in `rca/prompt_rca/` that:",
+      "    - Monitors quality metrics (hallucination rate, policy violation rate, user negative feedback rate) segmented by `prompt_template_id` and `prompt_template_version`.",
+      "    - Implements pre/post-change comparisons using rolling windows and two-sample tests (e.g., bootstrap confidence intervals or a non-parametric test) between version N and version N-1.",
+      "    - Emits `prompt_regression_event` records when statistically significant degradations are observed.",
+      "Layered hallucination evaluation (Section 9.3):",
+      "  - LLM judges: one or more configured LLMs (e.g., gpt-4, local open-source) invoked via `evaluators/llm_judges.py`, producing:",
+      "    - `hallucination_label_llm` in {\"no\", \"partial\", \"yes\"}.",
+      "    - `justification_llm` (short natural-language rationale).",
+      "    - `support_alignment_score` (0\u20131) comparing answer against retrieved context passages.",
+      "  - Non-LLM judges:",
+      "    - Heuristic evaluator in `evaluators/heuristic_judges.py` that checks entity/claim overlap between the answer and retrieved documents using keyword and embedding similarity.",
+      "    - Optional task-specific rule-based validators (e.g., schema conformance, allowed entity lists) for structured tasks.",
+      "  - Aggregation logic that computes a `hallucination_consensus_label` and `hallucination_confidence` from both LLM and non-LLM judges.",
+      "Layered root-cause attribution for hallucinations (Section 9.4):",
+      "  - Attribution module `rca/content_attribution/` implementing a decision tree / scoring model that uses:",
+      "    - Retrieval metrics: recall proxy, relevance scores, coverage ratio (tokens from context referenced in answer), retrieval latency and error rates.",
+      "    - Model behavior metrics: random-seed variance (if available), temperature/decoding settings, per-model hallucination baseline (from Chapter 10 experiments).",
+      "    - Prompt metrics: recent changes to `prompt_template_version`, diff complexity (e.g., prompt length delta, new instructions), historical performance per template.",
+      "    - Policy metrics: moderation trigger categories, changes in policy engine configuration, block/allow counts per category.",
+      "  - Outputs a ranked attribution vector for each incident: e.g., `{\"retrieval\": 0.7, \"prompt\": 0.2, \"model\": 0.05, \"policy\": 0.05}` plus a discrete `primary_cause` label.",
+      "Policy-aware RCA instrumentation (Section 9.5):",
+      "  - Policy layer metadata schema capturing:",
+      "    - `policy_rule_id`, `policy_version`, `policy_category` (e.g., PII, self-harm, hate, IP).",
+      "    - `policy_engine` (e.g., vendor moderation API vs. custom classifier).",
+      "    - `decision` (allow, block, modify, log-only) and `reason_code`.",
+      "  - Integration of policy events into the RCA pipeline so prompt and hallucination incidents can be correlated with concurrent policy configuration changes.",
+      "Prompt- and content-focused RCA module (Section 9.6):",
+      "  - Combined service `services/prompt_content_rca_service.py` that:",
+      "    - Ingests LLM interaction events enriched with prompt, retrieval, and policy metadata.",
+      "    - Attaches layered hallucination and policy evaluations.",
+      "    - Runs attribution logic to propose candidate root causes and confidence scores.",
+      "    - Exposes an API endpoint `/rca/content_root_cause` used by the broader RCA orchestrator (from Chapter 8) to fetch detailed content-centric diagnoses.",
+      "RAG hallucination incident workflow (Section 9.7):",
+      "  - Scenario scaffolding in `scenarios/chap9_rag_hallucination/` with scripts to:",
+      "    - Configure a baseline, healthy RAG setup.",
+      "    - Apply controlled perturbations (retrieval degradation, prompt regression, policy configuration changes).",
+      "    - Generate labeled evaluation traces for both baseline and treatment RCA systems.",
+      "  - Experiment driver in `scripts/run_chap9_experiment.py` that:",
+      "    - Runs workloads under baseline vs. treatment configurations.",
+      "    - Collects, aggregates, and exports metrics required for this experiment."
+    ]
+  },
+  "workloads": [
+    {
+      "name": "W1-prompt-regression-detection",
+      "description": "Synthetic workload focused on detecting and diagnosing prompt/template regressions independent of retrieval and model changes.",
+      "traffic_profile": {
+        "pattern": "steady",
+        "request_rate_rps": 1,
+        "duration_minutes": 60
+      },
+      "phases": [
+        {
+          "name": "W1-baseline-prompt-v1",
+          "duration_minutes": 20,
+          "configuration": {
+            "prompt_template_version": "answering-assistant-v1",
+            "retrieval_state": "healthy",
+            "model_version": "model-A-stable",
+            "policy_config": "policy-v1"
+          }
+        },
+        {
+          "name": "W1-prompt-regression-v2",
+          "duration_minutes": 20,
+          "configuration": {
+            "prompt_template_version": "answering-assistant-v2-regressed",
+            "retrieval_state": "healthy",
+            "model_version": "model-A-stable",
+            "policy_config": "policy-v1"
+          },
+          "change_description": "Prompt updated to emphasize creativity and verbosity, accidentally de-emphasizing faithfulness to provided context."
+        },
+        {
+          "name": "W1-prompt-fix-v3",
+          "duration_minutes": 20,
+          "configuration": {
+            "prompt_template_version": "answering-assistant-v3-fixed",
+            "retrieval_state": "healthy",
+            "model_version": "model-A-stable",
+            "policy_config": "policy-v1"
+          },
+          "change_description": "Prompt revised to explicitly require grounding to retrieved context with instructions not to fabricate unknowns."
+        }
+      ],
+      "request_corpus": "Use a fixed set of 200\u2013500 Q&A-style prompts with available ground-truth documents in `data/qa_corpus/`, replayed uniformly at random to ensure comparable input distribution across phases.",
+      "purpose": "Measure whether the treatment system detects and attributes regressions to the prompt/template layer more quickly and accurately than the baseline system."
+    },
+    {
+      "name": "W2-rag-hallucination-incident",
+      "description": "Controlled RAG hallucination incident for evaluating layered attribution (retrieval vs. model vs. prompt) and the end-to-end RCA case study.",
+      "traffic_profile": {
+        "pattern": "phased",
+        "request_rate_rps": 2,
+        "duration_minutes": 90
+      },
+      "phases": [
+        {
+          "name": "W2-healthy-rag",
+          "duration_minutes": 30,
+          "configuration": {
+            "retrieval_state": "healthy",
+            "index_version": "index-v1",
+            "embedding_model_version": "embed-A",
+            "prompt_template_version": "rag-assistant-v1",
+            "model_version": "model-A-stable",
+            "policy_config": "policy-v1"
+          }
+        },
+        {
+          "name": "W2-retrieval-degradation",
+          "duration_minutes": 30,
+          "configuration": {
+            "retrieval_state": "degraded",
+            "index_version": "index-v2-buggy",
+            "embedding_model_version": "embed-B-misaligned",
+            "prompt_template_version": "rag-assistant-v1",
+            "model_version": "model-A-stable",
+            "policy_config": "policy-v1"
+          },
+          "change_description": "Simulate a bad ingestion/indexing job: subset of documents missing, embedding model changed without re-tuning similarity threshold, recall and relevance drop."
+        },
+        {
+          "name": "W2-prompt-compensation",
+          "duration_minutes": 30,
+          "configuration": {
+            "retrieval_state": "degraded",
+            "index_version": "index-v2-buggy",
+            "embedding_model_version": "embed-B-misaligned",
+            "prompt_template_version": "rag-assistant-v2-heuristic-fix",
+            "model_version": "model-A-stable",
+            "policy_config": "policy-v1"
+          },
+          "change_description": "Prompt tweaked to compensate (e.g., telling the model to answer even when context looks incomplete), increasing hallucination rate further."
+        }
+      ],
+      "request_corpus": "Use the same RAG question set as `data/rag_case_study/`, focused on fact-heavy queries where missing documents or low relevance will visibly increase hallucinations.",
+      "purpose": "Exercise the end-to-end RAG hallucination RCA workflow from detection through layered attribution, and compare baseline vs. treatment accuracy in assigning root causes to retrieval, prompt, or combined issues."
+    },
+    {
+      "name": "W3-policy-failure-incident",
+      "description": "Scenario targeting policy, moderation, and compliance filter RCA.",
+      "traffic_profile": {
+        "pattern": "phased",
+        "request_rate_rps": 1,
+        "duration_minutes": 60
+      },
+      "phases": [
+        {
+          "name": "W3-healthy-policy",
+          "duration_minutes": 20,
+          "configuration": {
+            "policy_config": "policy-v1",
+            "policy_engine": "moderation-engine-A",
+            "prompt_template_version": "policy-aware-assistant-v1",
+            "retrieval_state": "healthy",
+            "model_version": "model-A-stable"
+          }
+        },
+        {
+          "name": "W3-overblocking-policy-change",
+          "duration_minutes": 20,
+          "configuration": {
+            "policy_config": "policy-v2-stricter",
+            "policy_engine": "moderation-engine-A",
+            "prompt_template_version": "policy-aware-assistant-v1",
+            "retrieval_state": "healthy",
+            "model_version": "model-A-stable"
+          },
+          "change_description": "Tighten policy rules so that benign medical or financial advice is blocked, causing usability issues without content hallucinations."
+        },
+        {
+          "name": "W3-underblocking-policy-bug",
+          "duration_minutes": 20,
+          "configuration": {
+            "policy_config": "policy-v3-buggy",
+            "policy_engine": "moderation-engine-A",
+            "prompt_template_version": "policy-aware-assistant-v1",
+            "retrieval_state": "healthy",
+            "model_version": "model-A-stable"
+          },
+          "change_description": "Introduce a misconfigured rule that fails to block certain prohibited categories, leading to policy-violation incidents."
+        }
+      ],
+      "request_corpus": "Use a curated mix of clearly allowed, borderline, and clearly disallowed prompts in `data/policy_corpus/`, with ground-truth labels for expected decisions and categories.",
+      "purpose": "Assess whether the treatment system can correctly attribute incident spikes to policy-layer misconfiguration rather than model, retrieval, or prompt issues, and surface the relevant policy rules as candidate root causes."
+    }
+  ],
+  "controls": {
+    "shared_between_baseline_and_treatment": [
+      "Use identical workloads (same request corpora, order, and timestamps) for baseline and treatment by recording and replaying interaction requests from a single canonical run.",
+      "Use the same underlying LLM(s), hardware, and inference configuration (temperature, max_tokens, top_p, etc.) for both baseline and treatment to isolate the effect of RCA instrumentation and logic.",
+      "Keep retrieval infrastructure, vector databases, and data assets identical within each scenario run; apply the same scripted perturbations (broken index, embedding model change, policy config change) in both baseline and treatment runs.",
+      "Use the same evaluation prompts and parameters for LLM judges across baseline and treatment, differing only in additional metadata/context that the treatment may pass (e.g., explicit retrieval snippets and prompt metadata).",
+      "Disable any automated remediation: both systems are in diagnosis-only mode; no configuration or routing changes are applied automatically in response to detected incidents.",
+      "Clock synchronization and time-window alignment: all events are timestamped in UTC with millisecond precision; detection and attribution windows are defined identically.",
+      "Sampling: ensure that any event sampling strategy (if used) is configured identically for baseline and treatment or disabled for this experiment."
+    ],
+    "randomization": [
+      "Random seed for request corpus shuffling is fixed and recorded; the same seed is used for both baseline and treatment replays.",
+      "If the LLM supports deterministic decoding (e.g., temperature=0), use it where possible; otherwise, fix random seeds and record them in event metadata for post-hoc comparison."
+    ],
+    "blinding_and_labeling": [
+      "Ground-truth labels for hallucination presence, policy correctness, and intended root cause category are created by human annotators or a pre-defined rule-based oracle and stored in `data/labels/chap9/`.",
+      "During initial RCA runs and metric computation, the RCA system does not have access to these ground-truth labels; they are only used for evaluation, not as inputs to the attribution logic.",
+      "Annotators labeling ground truth should be blind to whether data came from baseline or treatment runs to avoid bias."
+    ]
+  },
+  "metrics": [
+    {
+      "name": "time_to_first_detection_seconds",
+      "unit": "seconds",
+      "description": "Elapsed wall-clock time from the true onset of an induced incident (prompt change, retrieval bug, policy config change) to the first RCA detection event that flags an issue related to that incident (e.g., a prompt regression alert or retrieval-related hallucination spike alert)."
+    },
+    {
+      "name": "time_to_root_cause_hypothesis_seconds",
+      "unit": "seconds",
+      "description": "Elapsed wall-clock time from incident onset to the first RCA event that proposes a root cause hypothesis with primary cause label matching the ground-truth dominant cause category (prompt, retrieval, model, policy)."
+    },
+    {
+      "name": "root_cause_attribution_accuracy",
+      "unit": "proportion",
+      "description": "Proportion of incidents where the top-1 `primary_cause` output by the RCA system matches the ground-truth primary cause label."
+    },
+    {
+      "name": "root_cause_top3_recall",
+      "unit": "proportion",
+      "description": "Proportion of incidents where the ground-truth primary cause appears within the top-3 ranked candidate causes proposed by the RCA system."
+    },
+    {
+      "name": "hallucination_detection_precision",
+      "unit": "proportion",
+      "description": "For individual responses, the precision of hallucination detection: TP / (TP + FP), where TP = responses correctly labeled as hallucinations vs. ground truth."
+    },
+    {
+      "name": "hallucination_detection_recall",
+      "unit": "proportion",
+      "description": "For individual responses, the recall of hallucination detection: TP / (TP + FN)."
+    },
+    {
+      "name": "hallucination_severity_correlation",
+      "unit": "pearson_correlation",
+      "description": "Correlation between RCA system's hallucination severity/confidence scores and an ordinal human-annotated severity scale (e.g., 0\u20133)."
+    },
+    {
+      "name": "prompt_regression_detection_rate",
+      "unit": "proportion",
+      "description": "Fraction of induced prompt regressions that are detected and explicitly flagged as prompt/template-related incidents within a predefined time window (e.g., 30 minutes)."
+    },
+    {
+      "name": "prompt_false_positive_rate",
+      "unit": "proportion",
+      "description": "Among all periods with no intentional prompt changes or prompt-related regressions, fraction of times the system incorrectly emits a prompt-regression incident."
+    },
+    {
+      "name": "policy_misconfig_attribution_accuracy",
+      "unit": "proportion",
+      "description": "Proportion of policy-related incidents where the RCA system correctly identifies policy/configuration as the primary cause rather than misattributing to prompt, model, or retrieval."
+    },
+    {
+      "name": "rca_signal_overhead_ms_per_request",
+      "unit": "milliseconds",
+      "description": "Additional end-to-end processing latency per request introduced by the treatment RCA content module compared to baseline, measured at the observability/RCA pipeline (not user-facing P99 latency)."
+    },
+    {
+      "name": "rca_compute_overhead_cost_per_1k_requests",
+      "unit": "usd",
+      "description": "Additional compute and evaluator costs per 1,000 requests introduced by added instrumentation, LLM/non-LLM judges, and attribution logic in the treatment system vs. baseline."
+    }
+  ],
+  "success_criteria": {
+    "primary": [
+      {
+        "metric": "time_to_root_cause_hypothesis_seconds",
+        "aggregation": "median_across_incidents",
+        "target_improvement": ">= 30% reduction",
+        "comparison": "treatment_vs_baseline",
+        "scenarios": [
+          "W1-prompt-regression-detection",
+          "W2-rag-hallucination-incident",
+          "W3-policy-failure-incident"
+        ]
+      },
+      {
+        "metric": "root_cause_attribution_accuracy",
+        "aggregation": "overall_across_incidents",
+        "target_absolute_gain": ">= 0.20",
+        "comparison": "treatment_minus_baseline",
+        "scenarios": [
+          "W1-prompt-regression-detection",
+          "W2-rag-hallucination-incident",
+          "W3-policy-failure-incident"
+        ]
+      }
+    ],
+    "secondary": [
+      {
+        "metric": "hallucination_detection_precision",
+        "aggregation": "macro_average_across_scenarios",
+        "target_absolute_gain": ">= 0.10",
+        "comparison": "treatment_minus_baseline",
+        "scenarios": [
+          "W1-prompt-regression-detection",
+          "W2-rag-hallucination-incident"
+        ]
+      },
+      {
+        "metric": "hallucination_detection_recall",
+        "aggregation": "macro_average_across_scenarios",
+        "target_absolute_gain": ">= 0.10",
+        "comparison": "treatment_minus_baseline",
+        "scenarios": [
+          "W1-prompt-regression-detection",
+          "W2-rag-hallucination-incident"
+        ]
+      },
+      {
+        "metric": "policy_misconfig_attribution_accuracy",
+        "aggregation": "on_W3_only",
+        "target_absolute_gain": ">= 0.20",
+        "comparison": "treatment_minus_baseline",
+        "scenarios": [
+          "W3-policy-failure-incident"
+        ]
+      },
+      {
+        "metric": "rca_signal_overhead_ms_per_request",
+        "aggregation": "p95",
+        "target_absolute_increase": "<= 50",
+        "comparison": "treatment_minus_baseline",
+        "scenarios": [
+          "all"
+        ]
+      },
+      {
+        "metric": "rca_compute_overhead_cost_per_1k_requests",
+        "aggregation": "point_estimate",
+        "target_absolute_increase": "<= 0.05",
+        "comparison": "treatment_minus_baseline",
+        "scenarios": [
+          "all"
+        ]
+      }
+    ],
+    "interpretation_notes": [
+      "If primary criteria are met but secondary cost/overhead criteria are violated, results should be considered for production with additional optimization and/or sampling strategies for evaluators.",
+      "If attribution accuracy improves but time_to_root_cause_hypothesis_seconds does not, this suggests the need for tighter integration between content RCA module and upstream incident detectors (Chapters 7\u20138).",
+      "If hallucination detection precision improves at the expense of significant recall loss, threshold and consensus logic between LLM and non-LLM judges should be tuned and re-evaluated."
+    ]
+  },
+  "failure_modes": [
+    {
+      "name": "label_leakage_into_attribution_logic",
+      "description": "Ground-truth labels for hallucinations or root causes inadvertently influencing attribution decisions (e.g., being used as features).",
+      "mitigations": [
+        "Strictly separate data pipelines and storage for ground truth labels vs. RCA inputs.",
+        "Audit code paths in `rca/content_attribution/` and `services/prompt_content_rca_service.py` to ensure they only use runtime signals (no labels).",
+        "Add unit tests verifying that attribution outputs remain non-trivial when ground-truth labels are removed or shuffled."
+      ]
+    },
+    {
+      "name": "unstable_llm_judge_behavior",
+      "description": "High variance in LLM evaluator judgments across runs due to temperature settings or non-determinism, obscuring gains from the treatment system.",
+      "mitigations": [
+        "Use deterministic or low-temperature settings for judges (e.g., temperature=0 or 0.1).",
+        "Cache judge responses keyed by (question, retrieval_context, answer, judge_prompt_version).",
+        "Run multiple evaluation passes and aggregate, if necessary, with majority voting to reduce variance."
+      ]
+    },
+    {
+      "name": "confounded_by_retrieval_or_model_changes",
+      "description": "Incidents intended to be prompt- or policy-centric are accidentally coupled with retrieval or model changes, making attribution ambiguous.",
+      "mitigations": [
+        "Use configuration manifests for each phase specifying only the intended change; validate by diffing manifests between phases.",
+        "Add guard checks in `scripts/run_chap9_experiment.py` that assert no unintended config differences between phases.",
+        "Log all relevant versions (prompt, model, retrieval, policy) with each request and cross-validate against expected scenario definitions."
+      ]
+    },
+    {
+      "name": "evaluation_metric_mismatch",
+      "description": "Automatic hallucination labels (from LLM/non-LLM judges) disagree significantly with human ground truth, making improvements in RCA metrics hard to interpret.",
+      "mitigations": [
+        "Calibrate judges on a small, high-quality human-labeled validation set before the main experiment.",
+        "Compute and report judge-vs-human agreement statistics separately to contextualize results.",
+        "Optionally, use human labels as the primary ground truth for a subset of the data and compare metrics restricted to that subset."
+      ]
+    },
+    {
+      "name": "observability_backpressure_or_loss",
+      "description": "Additional instrumentation for prompts and content overloads the event pipeline, leading to dropped or delayed events and skewed metrics.",
+      "mitigations": [
+        "Run load tests on the instrumentation and RCA pipeline prior to the main experiment to determine safe throughput.",
+        "Enable backpressure-aware ingestion with explicit logging of dropped events counts.",
+        "For this experiment, keep request rates modest and verify ingestion completeness via sequence numbers."
+      ]
+    },
+    {
+      "name": "policy_ground_truth_ambiguity",
+      "description": "Borderline policy cases where human raters or compliance teams disagree about the correct outcome, complicating attribution accuracy measurement.",
+      "mitigations": [
+        "Restrict primary attribution metrics to prompts with high inter-rater agreement.",
+        "Maintain separate metrics for clearly allowed, borderline, and clearly disallowed prompts.",
+        "Document the policy label set and rater instructions in `docs/chap9_policy_labeling.md`."
+      ]
+    }
+  ],
+  "required_environment": {
+    "infrastructure": [
+      "Kubernetes cluster or equivalent container orchestration environment capable of running:",
+      "  - The RAG application service (`examples/rag_app/`).",
+      "  - The generic RCA services from Chapters 5\u20138 (signal collection, storage, detection, hypothesis generation).",
+      "  - The new prompt- and content-focused RCA module (`services/prompt_content_rca_service.py`).",
+      "  - Evaluation services (LLM judges, non-LLM judges).",
+      "  - Supporting databases and queues (e.g., PostgreSQL for metadata, Elasticsearch/OpenSearch for logs, Kafka/Redpanda or similar for event streaming).",
+      "Vector database (e.g., PostgreSQL+pgvector, Qdrant, Weaviate, or similar) to host the RAG index, with support for versioned indexes.",
+      "Object storage or equivalent (e.g., S3/minio) for storing evaluation traces, labels, and experiment outputs.",
+      "Networking and ingress configuration to route traffic from the workload generator to the RAG API and to allow RCA services to reach external LLM APIs if needed."
+    ],
+    "software": [
+      "Python 3.10+ with dependencies specified in `requirements.txt` or `pyproject.toml` in the repo.",
+      "Containerization tools (Docker) and deployment scripts/manifests under `deploy/`.",
+      "Access to at least one high-quality LLM for use as a judge (e.g., via OpenAI, Anthropic, or a local open-source model such as Llama variants). The same judge configuration must be used across baseline and treatment.",
+      "Embedding model(s) (cloud or local) to support RAG retrieval.",
+      "Monitoring/observability stack compatible with earlier chapters (e.g., OpenTelemetry collector, Prometheus, Grafana) for measuring RCA overhead metrics."
+    ],
+    "datasets": [
+      "Q&A corpus for W1 with associated ground-truth documents and hallucination labels where possible, stored under `data/qa_corpus/`.",
+      "RAG-specific corpus for W2 with source documents, queries, and ground-truth answers in `data/rag_case_study/`.",
+      "Policy test corpus for W3 with prompts and ground-truth decisions and categories in `data/policy_corpus/`.",
+      "Ground-truth labels for hallucination presence/severity, primary root cause category, and policy correctness under `data/labels/chap9/`."
+    ],
+    "configuration": [
+      "Baseline RCA configuration file in `config/rca_baseline.yaml` with content-focused features disabled or minimized.",
+      "Treatment RCA configuration file in `config/rca_prompt_content_enabled.yaml` with content-focused features enabled.",
+      "Scenario configuration files for W1, W2, W3 in `config/scenarios/chap9/` describing phases, configuration changes, and incident onset timestamps.",
+      "Experiment-level config `config/experiments/chap9_experiment.yaml` specifying metrics to collect, sampling options, and storage paths for outputs."
+    ]
+  },
+  "run_instructions": [
+    "1. Clone the repository and set up environment:",
+    "   - `git clone https://github.com/bookauthority/automated-rca-llm-failures.git`",
+    "   - `cd automated-rca-llm-failures`",
+    "   - Create a Python virtual environment and install dependencies:",
+    "     - `python -m venv .venv && source .venv/bin/activate`",
+    "     - `pip install -r requirements.txt`",
+    "",
+    "2. Start core infrastructure and base services:",
+    "   - Use provided docker-compose or Kubernetes manifests under `deploy/`:",
+    "     - `docker compose -f deploy/docker-compose-core.yaml up -d`",
+    "   - This should start:",
+    "     - The vector DB for RAG.",
+    "     - PostgreSQL (or equivalent) for metadata.",
+    "     - Kafka/Redpanda (or equivalent) for event streaming.",
+    "     - Observability components (OTel collector, Prometheus, Grafana) as defined in the repo.",
+    "",
+    "3. Deploy the baseline RAG app and generic RCA stack:",
+    "   - `docker compose -f deploy/docker-compose-rag-app.yaml up -d`",
+    "   - `docker compose -f deploy/docker-compose-rca-generic.yaml up -d`",
+    "   - Verify that the RAG app endpoint (e.g., `http://localhost:8000/api/chat`) and RCA API (Chapter 8 orchestrator) are reachable.",
+    "",
+    "4. Prepare datasets and indexes:",
+    "   - Run the data preparation scripts for the QA and RAG corpora:",
+    "     - `python scripts/prepare_data_qa_corpus.py --config config/data/qa_corpus.yaml`",
+    "     - `python scripts/prepare_data_rag_case_study.py --config config/data/rag_case_study.yaml`",
+    "   - Build the initial healthy RAG index (index-v1) using:",
+    "     - `python scripts/build_rag_index.py --config config/indexes/index_v1.yaml`",
+    "   - Build additional degraded/buggy index versions for W2 as needed:",
+    "     - `python scripts/build_rag_index.py --config config/indexes/index_v2_buggy.yaml`",
+    "",
+    "5. Configure and run the baseline experiment runs:",
+    "   - Ensure baseline RCA config is active:",
+    "     - Set environment variable: `export RCA_CONFIG=config/rca_baseline.yaml`.",
+    "   - Run workload W1 under baseline:",
+    "     - `python scripts/run_workload.py --scenario config/scenarios/chap9/W1_prompt_regression.yaml --mode baseline`",
+    "   - Run workload W2 under baseline:",
+    "     - `python scripts/run_workload.py --scenario config/scenarios/chap9/W2_rag_hallucination.yaml --mode baseline`",
+    "   - Run workload W3 under baseline:",
+    "     - `python scripts/run_workload.py --scenario config/scenarios/chap9/W3_policy_failure.yaml --mode baseline`",
+    "   - Each run should:",
+    "     - Generate and send requests to the RAG app.",
+    "     - Capture interaction events via instrumentation and stream them to the RCA pipeline.",
+    "     - Store raw traces in `artifacts/chap9/baseline/{W1,W2,W3}/`.",
+    "",
+    "6. Deploy and enable the prompt- and content-focused RCA module:",
+    "   - Start the new module:",
+    "     - `docker compose -f deploy/docker-compose-prompt-content-rca.yaml up -d`",
+    "   - Ensure event routing is updated so the prompt/content RCA service subscribes to interaction events and publishes attribution outputs.",
+    "   - Switch to treatment RCA config:",
+    "     - `export RCA_CONFIG=config/rca_prompt_content_enabled.yaml`.",
+    "",
+    "7. Run the treatment experiment runs with identical workloads:",
+    "   - For each scenario, use the same request seeds / schedules as baseline. If supported, pass `--replay_from` to reuse recorded requests:",
+    "     - `python scripts/run_workload.py --scenario config/scenarios/chap9/W1_prompt_regression.yaml --mode treatment --replay_from artifacts/chap9/baseline/W1/requests.log`",
+    "     - `python scripts/run_workload.py --scenario config/scenarios/chap9/W2_rag_hallucination.yaml --mode treatment --replay_from artifacts/chap9/baseline/W2/requests.log`",
+    "     - `python scripts/run_workload.py --scenario config/scenarios/chap9/W3_policy_failure.yaml --mode treatment --replay_from artifacts/chap9/baseline/W3/requests.log`",
+    "   - Store treatment traces under `artifacts/chap9/treatment/{W1,W2,W3}/`.",
+    "",
+    "8. Run the evaluation and metric computation pipeline:",
+    "   - Execute the chapter-specific experiment driver:",
+    "     - `python scripts/run_chap9_experiment.py --baseline_dir artifacts/chap9/baseline --treatment_dir artifacts/chap9/treatment --labels_dir data/labels/chap9 --output_dir artifacts/chap9/results`",
+    "   - This script should:",
+    "     - Align baseline and treatment events using request IDs and timestamps.",
+    "     - Use ground-truth labels from `data/labels/chap9/` to compute metrics such as hallucination_detection_precision/recall and root_cause_attribution_accuracy.",
+    "     - Extract RCA detection and root cause hypothesis events from RCA logs to calculate time_to_first_detection_seconds and time_to_root_cause_hypothesis_seconds per incident.",
+    "     - Estimate RCA overhead metrics by comparing processing duration and evaluator invocations per request across baseline and treatment.",
+    "",
+    "9. Inspect and record results:",
+    "   - Review `artifacts/chap9/results/metrics_summary.json` and `metrics_by_scenario.json` for the computed metrics.",
+    "   - Optionally visualize results using provided notebooks:",
+    "     - `jupyter notebook notebooks/chap9_analysis.ipynb`",
+    "   - Export summarized tables/plots for inclusion in the chapter text and diagrams.",
+    "",
+    "10. Clean up:",
+    "   - Shut down experiment-specific services:",
+    "     - `docker compose -f deploy/docker-compose-prompt-content-rca.yaml down`",
+    "     - `docker compose -f deploy/docker-compose-rag-app.yaml down`",
+    "   - Leave core data services running if needed for further experiments, or tear them down with:",
+    "     - `docker compose -f deploy/docker-compose-core.yaml down`"
+  ],
+  "evidence_schema": {
+    "event_level": {
+      "interaction_event": {
+        "fields": [
+          "request_id: string (UUID) \u2013 unique per user request.",
+          "session_id: string \u2013 optional logical session identifier.",
+          "timestamp_utc: string (ISO 8601 with ms) \u2013 event creation time.",
+          "user_query: string \u2013 raw or redacted user input.",
+          "response_text: string \u2013 model output (may be truncated or redacted for privacy).",
+          "model_version: string \u2013 identifier for model used.",
+          "prompt_template_id: string \u2013 logical prompt/template key.",
+          "prompt_template_version: string \u2013 semantic version or hash of template.",
+          "prompt_metadata: object \u2013 {intent, task_type, owner_team, safety_profile, rollout_strategy, ...}.",
+          "prompt_diff_from_previous: string or object \u2013 optional patch when version changed.",
+          "retrieval_state: string \u2013 {healthy, degraded, none} (from scenario or monitoring).",
+          "index_version: string \u2013 RAG index identifier.",
+          "embedding_model_version: string \u2013 embedding model used for retrieval.",
+          "retrieved_context_docs: array<object> \u2013 [{doc_id, snippet, relevance_score, rank}, ...].",
+          "retrieval_metrics: object \u2013 {num_docs, avg_relevance, coverage_ratio, retrieval_latency_ms}.",
+          "policy_engine: string \u2013 identifier for policy/moderation engine.",
+          "policy_config_version: string \u2013 configuration version of policy engine.",
+          "policy_decision: string \u2013 {allow, block, modify, log_only}.",
+          "policy_reason_codes: array<string> \u2013 specific rules/categories triggered.",
+          "user_feedback: object \u2013 {thumbs_up_down, rating_1_5, freeform_comment} when available.",
+          "llm_judge_output: object \u2013 {hallucination_label_llm, justification_llm, support_alignment_score, severity_score_llm}.",
+          "non_llm_judge_output: object \u2013 {hallucination_label_non_llm, heuristic_scores, rule_violations}.",
+          "hallucination_consensus_label: string \u2013 {none, mild, severe}.",
+          "hallucination_confidence: float \u2013 0\u20131 consensus confidence.",
+          "rca_content_attribution: object \u2013 {primary_cause, cause_scores: {prompt, retrieval, model, policy, other}}.",
+          "rca_detection_flags: object \u2013 {prompt_regression_detected, retrieval_degradation_detected, policy_misconfig_detected}.",
+          "latency_ms: float \u2013 user-visible latency (if measured).",
+          "rca_processing_latency_ms: float \u2013 additional RCA-related processing time.",
+          "cost_estimates: object \u2013 {eval_llm_tokens, eval_llm_cost_usd, compute_ms}."
+        ]
+      }
+    },
+    "incident_level": {
+      "incident_record": {
+        "fields": [
+          "incident_id: string (UUID).",
+          "scenario_name: string \u2013 {W1, W2, W3}.",
+          "phase_name: string \u2013 phase identifier within scenario.",
+          "incident_type: string \u2013 {prompt_regression, retrieval_hallucination_spike, policy_misconfig, mixed}.",
+          "primary_ground_truth_cause: string \u2013 {prompt, retrieval, model, policy, other}.",
+          "secondary_ground_truth_causes: array<string> \u2013 optional additional contributing causes.",
+          "incident_start_timestamp_utc: string \u2013 defined by scenario configuration.",
+          "incident_end_timestamp_utc: string \u2013 when configuration is reverted or incident resolved for evaluation.",
+          "rca_first_detection_timestamp_baseline: string or null \u2013 earliest detection event in baseline run.",
+          "rca_first_detection_timestamp_treatment: string or null \u2013 earliest detection event in treatment run.",
+          "rca_first_root_cause_timestamp_baseline: string or null \u2013 earliest correct root cause hypothesis in baseline run.",
+          "rca_first_root_cause_timestamp_treatment: string or null \u2013 earliest correct root cause hypothesis in treatment run.",
+          "baseline_primary_cause_label: string \u2013 top-1 cause predicted by baseline RCA.",
+          "treatment_primary_cause_label: string \u2013 top-1 cause predicted by treatment RCA.",
+          "baseline_top3_causes: array<string> \u2013 ordered by confidence.",
+          "treatment_top3_causes: array<string> \u2013 ordered by confidence.",
+          "num_affected_requests_baseline: integer \u2013 count of requests during incident in baseline run.",
+          "num_affected_requests_treatment: integer \u2013 same for treatment run."
+        ]
+      }
+    },
+    "metrics_level": {
+      "metrics_summary": {
+        "fields": [
+          "experiment_id: string \u2013 `chap9-prompt-policy-hallucination-rca-v1`.",
+          "timestamp_utc: string \u2013 when metrics were computed.",
+          "scenarios: array<string> \u2013 scenarios included in aggregation.",
+          "metrics: array<object> \u2013 each object containing:",
+          "  - name: string \u2013 metric name.",
+          "  - scenario: string or 'all'.",
+          "  - variant: string \u2013 {baseline, treatment}.",
+          "  - value: float \u2013 aggregated metric value.",
+          "  - ci_lower: float \u2013 lower bound of confidence interval (if computed).",
+          "  - ci_upper: float \u2013 upper bound of confidence interval (if computed).",
+          "  - n: integer \u2013 number of samples/incidents used."
+        ]
+      }
+    }
+  }
+}

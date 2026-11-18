@@ -1,0 +1,979 @@
+{
+  "experiment_id": "exp-11-data-retrieval-tooling-rca-v1",
+  "hypothesis": "Adding a dedicated data and tooling RCA subsystem that instruments ingestion, embedding, indexing, retrieval, and tool invocations will (a) detect and correctly localize at least 80% of induced data and tool failures within 5 minutes and (b) reduce the median time to identify root cause (MTTR-rca) for user-visible errors by at least 50% compared to a metrics-only observability baseline.",
+  "baseline": {
+    "description": "LLM RAG and tool-using application with standard observability (infrastructure metrics, basic logs, and request-level traces) but no specialized RCA subsystem for data, retrieval, or tooling. On-call engineers rely on ad-hoc dashboards and manual log inspection.",
+    "components": {
+      "llm_gateway": "HTTP API that accepts user queries, orchestrates RAG retrieval and tool calls, and returns responses.",
+      "rag_pipeline": {
+        "document_store": "Relational or object store containing source documents.",
+        "embedding_service": "Service that generates embeddings for documents and queries.",
+        "vector_index": "Vector database or index used for nearest-neighbor retrieval."
+      },
+      "tooling_layer": {
+        "tool_registry": "Static configuration of tools and their endpoints.",
+        "tools": [
+          "weather_api (HTTP-based mock service)",
+          "knowledge_graph_api (HTTP-based mock service)"
+        ]
+      },
+      "observability": {
+        "metrics": [
+          "LLM request throughput",
+          "LLM latency p50/p95",
+          "LLM error rate (HTTP 5xx/4xx)",
+          "tool call error rate",
+          "retrieval latency"
+        ],
+        "logs": [
+          "Application logs at INFO/WARN/ERROR",
+          "Tool invocation logs with status codes",
+          "Retriever logs with query and hit count"
+        ],
+        "traces": [
+          "Distributed traces for each user request, including spans for retrieval and tool calls"
+        ]
+      }
+    },
+    "rca_capabilities": {
+      "data_pipeline": "No explicit tracking of ingestion runs, data freshness, or embedding/index versions; only coarse job status metrics (success/failure).",
+      "retrieval": "No retrieval quality metrics (e.g., recall, coverage, relevance); only raw hit counts and latency.",
+      "tooling": "Tool failures visible only via error logs and generic error-rate metrics; no structured cause categorization or correlation to user-visible incidents.",
+      "user_correlation": "No automated correlation between user-visible failures and upstream data or tool events; triage is manual."
+    }
+  },
+  "treatment": {
+    "description": "Baseline system augmented with a specialized RCA subsystem for data, retrieval, and tooling. The subsystem consumes structured events from ingestion, embedding, indexing, retrieval, and tool layers; computes retrieval health metrics; detects anomalies; and correlates user-visible failures with upstream incidents.",
+    "rca_subsystem_components": {
+      "instrumentation": {
+        "ingestion_jobs": "Emit structured events for job_start, job_complete, job_failure, and per-batch stats (rows_processed, rows_failed, source_version, target_index_id).",
+        "embedding_pipeline": "Emit events for embedding_batch_processed with document_ids, embedding_model_version, success_count, failure_count, and latency distribution.",
+        "indexing_process": "Emit index_snapshot events capturing index_id, corpus_version, doc_count, last_update_ts, and shard_status.",
+        "retriever": "Emit retrieval_query events with query_id, user_request_id, query_text_hash, top_k, retrieved_doc_ids, retrieval_score_stats, and index_version.",
+        "tool_invocations": "Emit tool_call events with tool_name, version, input_schema_hash, status (success, timeout, 4xx, 5xx, logical_error), latency_ms, and response_summary_hash."
+      },
+      "event_pipeline": {
+        "transport": "Streaming bus (e.g., Kafka or Redis Streams) topic 'rca.events.data_tooling'.",
+        "schema_registry": "JSON schema or Avro schemas for job, embedding, indexing, retrieval, and tool events.",
+        "collector": "Python service that normalizes events into a unified RCA event model and writes to a time-series store and document store."
+      },
+      "retrieval_health_analyzers": {
+        "drift_detection": "Jobs that compare current retrieval metrics (recall proxy, coverage, relevance scores from an evaluator) to a rolling baseline and raise anomalies.",
+        "coverage_monitor": "Track per-namespace or per-dataset coverage and freshness (document counts, last_update_ts)."
+      },
+      "tooling_health_analyzers": {
+        "tool_error_classifier": "Classify tool_call failures into categories (network, timeout, auth, schema_mismatch, semantic_error).",
+        "flakiness_detector": "Compute rolling error rate and error burst patterns per tool endpoint and emit flakiness_incident events when thresholds or patterns are triggered."
+      },
+      "correlation_engine": {
+        "linking_logic": [
+          "Link user_request events to retrieval_query and tool_call events via correlation_ids.",
+          "Attach the latest ingestion_job, embedding_pipeline, and index_snapshot metadata to each retrieval_query.",
+          "Cluster user-visible failures by common upstream attributes (index_version, ingestion_job_id, tool_name, tool_endpoint)."
+        ],
+        "rca_alerts": {
+          "data_incident_alerts": "Emit alerts when a job failure correlates with a spike in retrieval misses or content-related user failures.",
+          "tool_incident_alerts": "Emit alerts when a tool becomes flaky, along with impacted user_request_ids and failure summaries."
+        }
+      }
+    }
+  },
+  "workloads": [
+    {
+      "name": "WL1-normal-mixed-traffic",
+      "description": "Baseline mixed workload of RAG and tool-using requests with healthy ingestion, retrieval, and tools.",
+      "pattern": {
+        "duration_minutes": 30,
+        "request_rate_rps": 5,
+        "composition": {
+          "rag_queries": 0.7,
+          "tool_only_requests": 0.2,
+          "combined_rag_plus_tool": 0.1
+        }
+      },
+      "user_request_templates": {
+        "rag_queries": [
+          "AskQuestionsAboutDocs(query='Summarize policy X section Y')",
+          "AskQuestionsAboutDocs(query='What are the support SLAs for product Z?')"
+        ],
+        "tool_only_requests": [
+          "GetWeather(location='San Francisco')",
+          "QueryKnowledgeGraph(entity='Product-123', relation='dependencies')"
+        ],
+        "combined_rag_plus_tool": [
+          "Use RAG to find latest maintenance window docs, then call calendar tool to check conflicts."
+        ]
+      },
+      "failure_injection": null
+    },
+    {
+      "name": "WL2-broken-ingestion-job",
+      "description": "Simulate a broken ingestion job that silently stops updating a subset of documents for the RAG corpus, leading to stale or missing content while the system continues serving.",
+      "pattern": {
+        "duration_minutes": 45,
+        "phases": [
+          {
+            "name": "pre-failure-steady-state",
+            "duration_minutes": 15,
+            "request_rate_rps": 5
+          },
+          {
+            "name": "post-failure",
+            "duration_minutes": 30,
+            "request_rate_rps": 5
+          }
+        ]
+      },
+      "failure_injection": {
+        "type": "data_ingestion_break",
+        "injection_time_minute": 15,
+        "details": {
+          "job": "nightly_corpus_ingestion",
+          "break_mode": "partial_silent_failure",
+          "affected_namespace": "policies/current",
+          "symptoms": [
+            "No new documents ingested after T0 for affected_namespace",
+            "ingestion_job reports 'success' (for the baseline, no structured error emission)",
+            "index_version remains unchanged for affected_namespace",
+            "user queries for newly added policies return outdated answers or missing content"
+          ]
+        }
+      }
+    },
+    {
+      "name": "WL3-flaky-tool-endpoint",
+      "description": "Simulate a flaky external tool/API used by the LLM agent that intermittently fails with timeouts and transient 5xx errors.",
+      "pattern": {
+        "duration_minutes": 45,
+        "phases": [
+          {
+            "name": "pre-flakiness",
+            "duration_minutes": 10,
+            "request_rate_rps": 5
+          },
+          {
+            "name": "flakiness",
+            "duration_minutes": 25,
+            "request_rate_rps": 5
+          },
+          {
+            "name": "recovery",
+            "duration_minutes": 10,
+            "request_rate_rps": 5
+          }
+        ]
+      },
+      "failure_injection": {
+        "type": "tool_flakiness",
+        "injection_time_minute": 10,
+        "details": {
+          "tool_name": "weather_api",
+          "endpoint": "/forecast",
+          "failure_pattern": [
+            {
+              "duration_minutes": 10,
+              "failure_rate": 0.4,
+              "error_types": [
+                "timeout",
+                "http_503"
+              ]
+            },
+            {
+              "duration_minutes": 15,
+              "failure_rate": 0.2,
+              "error_types": [
+                "http_500",
+                "timeout"
+              ]
+            }
+          ],
+          "symptoms": [
+            "User-visible responses that omit tool-based data or return fallback text.",
+            "Increased latency for requests requiring the tool.",
+            "Elevated error rates and retries for the tool endpoint."
+          ]
+        }
+      }
+    }
+  ],
+  "controls": {
+    "experimental_design": "A/B-style within-environment runs comparing baseline vs treatment under identical workloads and injected failures.",
+    "constants": {
+      "llm_model": "Same LLM model version, configuration, and provider used for both baseline and treatment.",
+      "rag_corpus": "Same underlying document set, same schema, and same initial index snapshot.",
+      "tools": "Same tool APIs, endpoints, rate limits, and failure injection patterns.",
+      "traffic_replay": "Deterministic or recorded workload generator with fixed random seeds and identical request sequences for baseline and treatment.",
+      "infrastructure": "Same hardware/VM shapes, network configuration, and deployment topology.",
+      "time_window": "Experiments run within a short time window to minimize background environment drift."
+    },
+    "variables": {
+      "independent": [
+        "Presence or absence of the data and tooling RCA subsystem (instrumentation, analyzers, correlation engine).",
+        "Injected failure types and timing (broken ingestion, flaky tool)."
+      ],
+      "dependent": [
+        "Time to detect data or tool incidents.",
+        "Time to correctly localize root cause.",
+        "Detection rate and precision for induced failures.",
+        "Volume and quality of RCA alerts."
+      ]
+    },
+    "replication": {
+      "runs_per_condition": 3,
+      "random_seeds": [
+        42,
+        43,
+        44
+      ],
+      "note": "Repeat WL2 and WL3 three times each for baseline and treatment to account for stochasticity in LLM outputs and network variability."
+    }
+  },
+  "metrics": [
+    {
+      "name": "incident_detection_latency_data_pipeline",
+      "unit": "seconds",
+      "description": "Elapsed time between the actual injection of the ingestion failure in WL2 and the first automated detection signal/alert indicating a data or ingestion-related issue."
+    },
+    {
+      "name": "incident_detection_latency_tooling",
+      "unit": "seconds",
+      "description": "Elapsed time between the start of tool flakiness in WL3 and the first automated detection signal/alert indicating a tool or API health issue."
+    },
+    {
+      "name": "rca_localization_time_data_pipeline",
+      "unit": "seconds",
+      "description": "Elapsed time between user-visible symptom onset for WL2 (first failed or stale-answer request) and the generation of an RCA artifact that points to the ingestion/indexing subsystem as the primary root cause."
+    },
+    {
+      "name": "rca_localization_time_tooling",
+      "unit": "seconds",
+      "description": "Elapsed time between user-visible symptom onset for WL3 and the generation of an RCA artifact that identifies the specific tool and endpoint as the primary root cause."
+    },
+    {
+      "name": "detection_recall_induced_incidents",
+      "unit": "ratio",
+      "description": "Fraction of induced incidents (ingestion breaks and tool flakiness episodes) that are detected by the system as incidents of any severity."
+    },
+    {
+      "name": "detection_precision_incident_alerts",
+      "unit": "ratio",
+      "description": "Fraction of generated incident alerts (classified as data or tool related) that correspond to real induced incidents (excluding benign anomalies and noise)."
+    },
+    {
+      "name": "localization_accuracy",
+      "unit": "ratio",
+      "description": "Fraction of detected incidents for which the RCA output correctly identifies the primary failing component (e.g., specific ingestion job or tool endpoint)."
+    },
+    {
+      "name": "mean_user_visible_error_rate",
+      "unit": "fraction_of_requests",
+      "description": "Average fraction of user requests during failure phases that result in user-visible errors or degraded responses (e.g., fallback messaging, stale content). Used mostly for contextualizing incident impact."
+    },
+    {
+      "name": "rca_event_volume",
+      "unit": "events_per_minute",
+      "description": "Rate of RCA-related events (instrumentation events plus RCA alerts) to evaluate overhead and signal volume between baseline and treatment."
+    },
+    {
+      "name": "rca_processing_overhead",
+      "unit": "milliseconds_per_request",
+      "description": "Additional processing latency added to user requests by RCA instrumentation and correlation logic, measured as the difference in median end-to-end latency between baseline and treatment under WL1."
+    }
+  ],
+  "success_criteria": {
+    "primary": [
+      {
+        "metric": "detection_recall_induced_incidents",
+        "condition": ">= 0.8",
+        "scope": "Across WL2 and WL3 for treatment runs; no minimum required for baseline."
+      },
+      {
+        "metric": "rca_localization_time_data_pipeline",
+        "condition": "<= 300",
+        "scope": "Median across treatment runs (5 minutes or less)."
+      },
+      {
+        "metric": "rca_localization_time_tooling",
+        "condition": "<= 300",
+        "scope": "Median across treatment runs (5 minutes or less)."
+      },
+      {
+        "metric": "rca_localization_time_data_pipeline",
+        "condition": "<= 0.5 * baseline_median",
+        "scope": "Ratio between treatment and baseline medians for WL2."
+      },
+      {
+        "metric": "rca_localization_time_tooling",
+        "condition": "<= 0.5 * baseline_median",
+        "scope": "Ratio between treatment and baseline medians for WL3."
+      },
+      {
+        "metric": "localization_accuracy",
+        "condition": ">= 0.8",
+        "scope": "Treatment runs combining WL2 and WL3."
+      }
+    ],
+    "secondary": [
+      {
+        "metric": "detection_precision_incident_alerts",
+        "condition": ">= 0.7",
+        "scope": "Treatment runs; ensures alerts are not excessively noisy."
+      },
+      {
+        "metric": "rca_processing_overhead",
+        "condition": "<= 20",
+        "scope": "Treatment vs baseline median latency difference under WL1 (<= 20 ms per request)."
+      }
+    ],
+    "interpretation_notes": [
+      "If primary criteria are met but secondary criteria fail (e.g., precision or overhead is worse than target), the subsystem is effective but needs tuning before production deployment.",
+      "If detection_recall_induced_incidents is low but localization_accuracy is high, consider improvements in anomaly thresholds and upstream signal coverage.",
+      "If localization_accuracy is low despite high detection_recall, correlation logic or schema coverage is likely insufficient."
+    ]
+  },
+  "failure_modes": [
+    {
+      "name": "undetected_ingestion_failure",
+      "description": "The ingestion break in WL2 does not trigger any data-related incident alert in the treatment condition.",
+      "impact": "Stale or missing content persists undetected, undermining the premise of the data RCA subsystem.",
+      "mitigations": [
+        "Verify that ingestion jobs emit events to the RCA bus and that schemas match expectations.",
+        "Lower anomaly detection thresholds for data freshness and index_version changes.",
+        "Add explicit SLIs for document freshness and corpus coverage per namespace."
+      ]
+    },
+    {
+      "name": "mislocalized_ingestion_root_cause",
+      "description": "An incident is detected in WL2 but RCA blames the LLM model or prompt configuration rather than the ingestion/indexing layer.",
+      "impact": "Engineers may pursue ineffective remediations, delaying the real fix.",
+      "mitigations": [
+        "Improve correlation rules to prioritize signals from ingestion failures temporally aligned with symptom spikes.",
+        "Enhance retrieval metrics and metadata to make index_version and corpus_version changes more salient.",
+        "Incorporate retriever-level quality probes (known-answer queries) as an additional signal."
+      ]
+    },
+    {
+      "name": "undetected_tool_flakiness",
+      "description": "The induced flakiness in WL3 does not cause any tool-related incident alert in the treatment condition.",
+      "impact": "User-visible errors from tools remain unexplained and require manual triage.",
+      "mitigations": [
+        "Ensure tool_call events are correctly emitted and ingested for both successes and failures.",
+        "Adjust flakiness detection thresholds and time windows for error-rate anomalies.",
+        "Include error-burst detection (e.g., consecutive failures) as a separate signal."
+      ]
+    },
+    {
+      "name": "false_positive_incident_alerts",
+      "description": "The RCA subsystem raises frequent data- or tool-related incident alerts even during WL1 normal operation.",
+      "impact": "On-call fatigue and distrust of RCA outputs.",
+      "mitigations": [
+        "Tune anomaly detection thresholds and require multiple confirmatory signals (e.g., combining error rate and user-visible symptom rate).",
+        "Introduce alert aggregation and suppression logic for low-severity anomalies.",
+        "Incorporate a baseline learning period before enabling high-severity alerts."
+      ]
+    },
+    {
+      "name": "excessive_rca_overhead",
+      "description": "RCA instrumentation and processing adds significant latency or resource consumption.",
+      "impact": "Degrades user experience and increases infrastructure costs.",
+      "mitigations": [
+        "Sample high-volume event streams while maintaining coverage for critical paths.",
+        "Move heavy analysis to asynchronous jobs rather than request inline flows.",
+        "Profile RCA services and optimize serialization, batching, and storage access."
+      ]
+    },
+    {
+      "name": "schema_drift_in_rca_events",
+      "description": "Event schemas change between runs, breaking parsers or correlation logic and invalidating comparisons between baseline and treatment.",
+      "impact": "Non-reproducible experiments and misleading metrics.",
+      "mitigations": [
+        "Use schema registry with versioning and explicit compatibility checks.",
+        "Pin RCA subsystem and application code to specific commits for the experiment.",
+        "Include schema_version fields in all events and assert expected versions in tests."
+      ]
+    }
+  ],
+  "required_environment": {
+    "infrastructure": {
+      "compute": "At least 3 nodes or VMs (or equivalent containers): one for the application (LLM gateway + RAG + tools), one for observability and storage (metrics + logs + RCA store), and one for the RCA subsystem and workload generator.",
+      "network": "Stable internal network with predictable latency; ability to simulate network issues for tools if desired.",
+      "storage": {
+        "metrics_store": "Prometheus or equivalent time-series database.",
+        "logs_store": "ELK stack, OpenSearch, or equivalent.",
+        "rca_store": "Document database (e.g., PostgreSQL, MongoDB, or S3-compatible object store) for RCA events and artifacts.",
+        "vector_db": "Any vector database used by the RAG pipeline (e.g., FAISS, Milvus, pgvector)."
+      }
+    },
+    "software_stack": {
+      "language_runtime": "Python 3.10+.",
+      "dependencies": [
+        "FastAPI or Flask for the LLM gateway and tools.",
+        "HTTP client library (e.g., httpx, requests).",
+        "Async task framework (e.g., asyncio, Celery, or similar) for background jobs.",
+        "Kafka client or Redis client for event streaming.",
+        "OpenTelemetry SDK for instrumentation (optional but recommended).",
+        "Prometheus client libraries.",
+        "Vector DB client SDK."
+      ],
+      "repository": "https://github.com/bookauthority/automated-rca-llm-failures",
+      "repository_layout_assumptions": {
+        "app_service": "services/app/",
+        "rag_pipeline": "services/rag/",
+        "tools": "services/tools/",
+        "rca_subsystem": "services/rca_data_tooling/",
+        "workload_generator": "experiments/workloads/",
+        "config": "configs/experiments/11-data-retrieval-tooling/"
+      }
+    },
+    "configuration": {
+      "environment_variables": [
+        "LLM_API_KEY",
+        "VECTOR_DB_URL",
+        "METRICS_ENDPOINT",
+        "LOGS_ENDPOINT",
+        "RCA_EVENT_BUS_BROKER",
+        "RCA_STORE_URL"
+      ],
+      "experiment_configs": [
+        "configs/experiments/11-data-retrieval-tooling/baseline.yaml",
+        "configs/experiments/11-data-retrieval-tooling/treatment.yaml"
+      ]
+    },
+    "data": {
+      "rag_corpus": "Synthetic document corpus for the domain (e.g., support policies and product docs) with at least 1,000 documents across multiple namespaces.",
+      "ingestion_scripts": "Scripts to populate document store and build baseline vector indices pre-experiment.",
+      "ground_truth_queries": "A small set of canonical queries with known relevant documents used to approximate recall and coverage metrics during WL2."
+    }
+  },
+  "run_instructions": [
+    {
+      "step": 1,
+      "title": "Clone repository and set up environment",
+      "commands": [
+        "git clone https://github.com/bookauthority/automated-rca-llm-failures.git",
+        "cd automated-rca-llm-failures",
+        "python -m venv .venv",
+        "source .venv/bin/activate  # or .venv\\Scripts\\activate on Windows",
+        "pip install -r requirements.txt"
+      ],
+      "notes": [
+        "Ensure any additional experiment-specific dependencies listed in experiments/11/requirements.txt are installed if present."
+      ]
+    },
+    {
+      "step": 2,
+      "title": "Provision and configure observability and RCA backing services",
+      "commands": [
+        "# Start local Prometheus, vector DB, and event bus via docker-compose",
+        "docker compose -f docker/docker-compose-observability.yml up -d",
+        "docker compose -f docker/docker-compose-vector-db.yml up -d",
+        "docker compose -f docker/docker-compose-event-bus.yml up -d"
+      ],
+      "notes": [
+        "Alternatively, point configs to existing Prometheus, vector DB, and Kafka/Redis deployments in your environment.",
+        "Verify connectivity using provided health-check scripts in scripts/healthchecks/."
+      ]
+    },
+    {
+      "step": 3,
+      "title": "Bootstrap RAG corpus and indices",
+      "commands": [
+        "python scripts/bootstrap_corpus.py --config configs/experiments/11-data-retrieval-tooling/corpus.yaml",
+        "python scripts/build_initial_index.py --config configs/experiments/11-data-retrieval-tooling/index.yaml"
+      ],
+      "notes": [
+        "These scripts should populate the document store and create the initial embedding and index snapshots used for WL1\u2013WL3.",
+        "Record the initial index_version emitted by the tooling for later verification."
+      ]
+    },
+    {
+      "step": 4,
+      "title": "Deploy baseline application stack (without RCA subsystem)",
+      "commands": [
+        "RCA_ENABLED=false python -m services.app.main --config configs/experiments/11-data-retrieval-tooling/baseline.yaml"
+      ],
+      "notes": [
+        "Ensure that only standard metrics/logging instrumentation is enabled.",
+        "Confirm that no RCA-specific event streams (e.g., rca.events.data_tooling) are being consumed."
+      ]
+    },
+    {
+      "step": 5,
+      "title": "Run baseline workloads WL1, WL2, WL3",
+      "commands": [
+        "python experiments/workloads/run_workload.py --config configs/experiments/11-data-retrieval-tooling/WL1-normal.yaml --mode baseline",
+        "python experiments/workloads/run_workload.py --config configs/experiments/11-data-retrieval-tooling/WL2-broken-ingestion.yaml --mode baseline",
+        "python experiments/workloads/run_workload.py --config configs/experiments/11-data-retrieval-tooling/WL3-flaky-tool.yaml --mode baseline"
+      ],
+      "notes": [
+        "Each workload config should specify the failure injection schedule and random_seed.",
+        "Repeat runs for each workload with different seeds (e.g., 42, 43, 44) by passing --seed=<value>.",
+        "During WL2 and WL3, ensure the failure injection scripts for ingestion and tool flakiness are invoked as configured."
+      ]
+    },
+    {
+      "step": 6,
+      "title": "Collect baseline metrics and RCA artifacts (if any)",
+      "commands": [
+        "python experiments/collect_metrics.py --run_dir runs/exp11/baseline/ --output runs/exp11/baseline/metrics.json"
+      ],
+      "notes": [
+        "At baseline, RCA-specific metrics (detection and localization) will likely be absent or set to sentinel values; these will serve as a comparison point for the treatment.",
+        "Export Prometheus time-series for the experiment window if needed for fine-grained analysis."
+      ]
+    },
+    {
+      "step": 7,
+      "title": "Deploy treatment application stack (with RCA subsystem)",
+      "commands": [
+        "RCA_ENABLED=true python -m services.rca_data_tooling.main --config configs/experiments/11-data-retrieval-tooling/rca.yaml",
+        "RCA_ENABLED=true python -m services.app.main --config configs/experiments/11-data-retrieval-tooling/treatment.yaml"
+      ],
+      "notes": [
+        "Confirm that ingestion, embedding, indexing, retrieval, and tool components are emitting RCA events to the event bus.",
+        "Verify RCA service health endpoints before running workloads."
+      ]
+    },
+    {
+      "step": 8,
+      "title": "Run treatment workloads WL1, WL2, WL3",
+      "commands": [
+        "python experiments/workloads/run_workload.py --config configs/experiments/11-data-retrieval-tooling/WL1-normal.yaml --mode treatment",
+        "python experiments/workloads/run_workload.py --config configs/experiments/11-data-retrieval-tooling/WL2-broken-ingestion.yaml --mode treatment",
+        "python experiments/workloads/run_workload.py --config configs/experiments/11-data-retrieval-tooling/WL3-flaky-tool.yaml --mode treatment"
+      ],
+      "notes": [
+        "Use the same seeds as in baseline runs to ensure comparable request sequences.",
+        "Monitor log output from services/rca_data_tooling to confirm incident detection and RCA artifacts are being generated."
+      ]
+    },
+    {
+      "step": 9,
+      "title": "Collect treatment metrics and RCA artifacts",
+      "commands": [
+        "python experiments/collect_metrics.py --run_dir runs/exp11/treatment/ --output runs/exp11/treatment/metrics.json",
+        "python experiments/collect_rca_artifacts.py --run_dir runs/exp11/treatment/ --output runs/exp11/treatment/rca_artifacts.json"
+      ],
+      "notes": [
+        "RCA artifacts should include timestamps for detection and localization, as well as structured root-cause summaries.",
+        "Confirm that the number of detected incidents aligns roughly with the known induced incidents."
+      ]
+    },
+    {
+      "step": 10,
+      "title": "Compute experiment-level summary metrics and compare baseline vs treatment",
+      "commands": [
+        "python experiments/analyze_exp11_results.py --baseline runs/exp11/baseline/metrics.json --treatment runs/exp11/treatment/metrics.json --output runs/exp11/summary.json"
+      ],
+      "notes": [
+        "This script should compute medians and distributions for detection and localization times, detection recall, precision, localization accuracy, and overhead.",
+        "No interpretation should be hard-coded; the summary is purely descriptive. You will interpret against success_criteria manually or in a separate notebook."
+      ]
+    }
+  ],
+  "evidence_schema": {
+    "type": "object",
+    "required": [
+      "experiment_id",
+      "runs",
+      "metrics_summary",
+      "rca_artifacts"
+    ],
+    "properties": {
+      "experiment_id": {
+        "type": "string",
+        "description": "ID of the experiment, must match 'exp-11-data-retrieval-tooling-rca-v1'."
+      },
+      "runs": {
+        "type": "array",
+        "description": "Per-run metadata and raw measurements for baseline and treatment.",
+        "items": {
+          "type": "object",
+          "required": [
+            "run_id",
+            "condition",
+            "workload",
+            "seed",
+            "timestamps",
+            "incident_ground_truth",
+            "incident_detections",
+            "metrics"
+          ],
+          "properties": {
+            "run_id": {
+              "type": "string",
+              "description": "Unique identifier for this specific run."
+            },
+            "condition": {
+              "type": "string",
+              "enum": [
+                "baseline",
+                "treatment"
+              ]
+            },
+            "workload": {
+              "type": "string",
+              "enum": [
+                "WL1-normal-mixed-traffic",
+                "WL2-broken-ingestion-job",
+                "WL3-flaky-tool-endpoint"
+              ]
+            },
+            "seed": {
+              "type": "integer",
+              "description": "Random seed used for the workload generator."
+            },
+            "timestamps": {
+              "type": "object",
+              "required": [
+                "start",
+                "end"
+              ],
+              "properties": {
+                "start": {
+                  "type": "string",
+                  "format": "date-time"
+                },
+                "end": {
+                  "type": "string",
+                  "format": "date-time"
+                }
+              }
+            },
+            "incident_ground_truth": {
+              "type": "array",
+              "description": "List of induced incidents and their ground-truth properties for this run.",
+              "items": {
+                "type": "object",
+                "required": [
+                  "incident_id",
+                  "type",
+                  "component",
+                  "start_time",
+                  "end_time"
+                ],
+                "properties": {
+                  "incident_id": {
+                    "type": "string"
+                  },
+                  "type": {
+                    "type": "string",
+                    "enum": [
+                      "data_ingestion_break",
+                      "tool_flakiness"
+                    ]
+                  },
+                  "component": {
+                    "type": "string",
+                    "description": "Name or identifier of the failing job, index, or tool endpoint."
+                  },
+                  "start_time": {
+                    "type": "string",
+                    "format": "date-time"
+                  },
+                  "end_time": {
+                    "type": "string",
+                    "format": "date-time"
+                  }
+                }
+              }
+            },
+            "incident_detections": {
+              "type": "array",
+              "description": "RCA or monitoring system incident detections for this run.",
+              "items": {
+                "type": "object",
+                "required": [
+                  "detection_id",
+                  "detected_time",
+                  "classification",
+                  "suspected_components"
+                ],
+                "properties": {
+                  "detection_id": {
+                    "type": "string"
+                  },
+                  "detected_time": {
+                    "type": "string",
+                    "format": "date-time"
+                  },
+                  "classification": {
+                    "type": "string",
+                    "enum": [
+                      "data_pipeline_incident",
+                      "retrieval_incident",
+                      "tooling_incident",
+                      "other"
+                    ]
+                  },
+                  "suspected_components": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  },
+                  "linked_ground_truth_incident_id": {
+                    "type": "string",
+                    "description": "If this detection can be matched to a ground-truth induced incident, record its ID; else null.",
+                    "nullable": true
+                  }
+                }
+              }
+            },
+            "metrics": {
+              "type": "object",
+              "description": "Per-run raw metrics (before aggregation across runs).",
+              "properties": {
+                "incident_detection_latency_data_pipeline": {
+                  "type": [
+                    "number",
+                    "null"
+                  ]
+                },
+                "incident_detection_latency_tooling": {
+                  "type": [
+                    "number",
+                    "null"
+                  ]
+                },
+                "rca_localization_time_data_pipeline": {
+                  "type": [
+                    "number",
+                    "null"
+                  ]
+                },
+                "rca_localization_time_tooling": {
+                  "type": [
+                    "number",
+                    "null"
+                  ]
+                },
+                "detection_recall_induced_incidents": {
+                  "type": [
+                    "number",
+                    "null"
+                  ]
+                },
+                "detection_precision_incident_alerts": {
+                  "type": [
+                    "number",
+                    "null"
+                  ]
+                },
+                "localization_accuracy": {
+                  "type": [
+                    "number",
+                    "null"
+                  ]
+                },
+                "mean_user_visible_error_rate": {
+                  "type": [
+                    "number",
+                    "null"
+                  ]
+                },
+                "rca_event_volume": {
+                  "type": [
+                    "number",
+                    "null"
+                  ]
+                },
+                "rca_processing_overhead": {
+                  "type": [
+                    "number",
+                    "null"
+                  ]
+                }
+              }
+            }
+          }
+        }
+      },
+      "metrics_summary": {
+        "type": "object",
+        "description": "Aggregated metrics across runs for baseline and treatment.",
+        "properties": {
+          "by_condition": {
+            "type": "object",
+            "properties": {
+              "baseline": {
+                "type": "object",
+                "description": "Aggregated metrics for baseline runs.",
+                "properties": {
+                  "incident_detection_latency_data_pipeline_median": {
+                    "type": [
+                      "number",
+                      "null"
+                    ]
+                  },
+                  "incident_detection_latency_tooling_median": {
+                    "type": [
+                      "number",
+                      "null"
+                    ]
+                  },
+                  "rca_localization_time_data_pipeline_median": {
+                    "type": [
+                      "number",
+                      "null"
+                    ]
+                  },
+                  "rca_localization_time_tooling_median": {
+                    "type": [
+                      "number",
+                      "null"
+                    ]
+                  },
+                  "detection_recall_induced_incidents_mean": {
+                    "type": [
+                      "number",
+                      "null"
+                    ]
+                  },
+                  "detection_precision_incident_alerts_mean": {
+                    "type": [
+                      "number",
+                      "null"
+                    ]
+                  },
+                  "localization_accuracy_mean": {
+                    "type": [
+                      "number",
+                      "null"
+                    ]
+                  },
+                  "rca_processing_overhead_median": {
+                    "type": [
+                      "number",
+                      "null"
+                    ]
+                  }
+                }
+              },
+              "treatment": {
+                "type": "object",
+                "description": "Aggregated metrics for treatment runs.",
+                "properties": {
+                  "incident_detection_latency_data_pipeline_median": {
+                    "type": [
+                      "number",
+                      "null"
+                    ]
+                  },
+                  "incident_detection_latency_tooling_median": {
+                    "type": [
+                      "number",
+                      "null"
+                    ]
+                  },
+                  "rca_localization_time_data_pipeline_median": {
+                    "type": [
+                      "number",
+                      "null"
+                    ]
+                  },
+                  "rca_localization_time_tooling_median": {
+                    "type": [
+                      "number",
+                      "null"
+                    ]
+                  },
+                  "detection_recall_induced_incidents_mean": {
+                    "type": [
+                      "number",
+                      "null"
+                    ]
+                  },
+                  "detection_precision_incident_alerts_mean": {
+                    "type": [
+                      "number",
+                      "null"
+                    ]
+                  },
+                  "localization_accuracy_mean": {
+                    "type": [
+                      "number",
+                      "null"
+                    ]
+                  },
+                  "rca_processing_overhead_median": {
+                    "type": [
+                      "number",
+                      "null"
+                    ]
+                  }
+                }
+              }
+            }
+          },
+          "baseline_vs_treatment_ratios": {
+            "type": "object",
+            "description": "Computed ratios to compare baseline and treatment for key metrics.",
+            "properties": {
+              "rca_localization_time_data_pipeline_ratio_treatment_over_baseline": {
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "rca_localization_time_tooling_ratio_treatment_over_baseline": {
+                "type": [
+                  "number",
+                  "null"
+                ]
+              }
+            }
+          }
+        }
+      },
+      "rca_artifacts": {
+        "type": "array",
+        "description": "Sample RCA outputs for representative incidents (for qualitative inspection).",
+        "items": {
+          "type": "object",
+          "required": [
+            "artifact_id",
+            "run_id",
+            "linked_incident_id",
+            "generated_time",
+            "root_cause_summary",
+            "confidence_score",
+            "supporting_evidence_refs"
+          ],
+          "properties": {
+            "artifact_id": {
+              "type": "string"
+            },
+            "run_id": {
+              "type": "string"
+            },
+            "linked_incident_id": {
+              "type": "string",
+              "description": "ID of the ground-truth incident this artifact pertains to, if applicable."
+            },
+            "generated_time": {
+              "type": "string",
+              "format": "date-time"
+            },
+            "root_cause_summary": {
+              "type": "string",
+              "description": "Human-readable summary generated by the RCA subsystem (e.g., via templates or LLM)."
+            },
+            "confidence_score": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1
+            },
+            "supporting_evidence_refs": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "description": "Identifiers for underlying events, logs, metrics, or traces used to produce this RCA artifact."
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

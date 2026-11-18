@@ -1,0 +1,713 @@
+{
+  "experiment_id": "exp-ch5-llm-instrumentation-otel-rca-signals-v1",
+  "hypothesis": "Adding structured, RCA-oriented instrumentation (LLM interaction event schema, OpenTelemetry traces/logs, and explicit feedback/guardrail signals) to an LLM gateway produces high-fidelity, query-correlatable RCA signals without materially impacting p95 latency (\u226410% overhead) or causing sensitive prompt/PII leakage in stored events.",
+  "baseline": {
+    "description": "Minimal LLM gateway without RCA-oriented instrumentation. Logs only coarse request metrics (timestamp, HTTP status, total latency) and opaque JSON request/response bodies with no standardized schema, tracing, or explicit RCA signals.",
+    "implementation_outline": {
+      "components": [
+        "Python FastAPI (or similar) LLM gateway exposing POST /v1/chat/completions",
+        "LLM client using environment-configured provider (e.g., OpenAI-compatible API or local model wrapper)",
+        "Naive logging using standard Python logging to stdout or a local file without structured fields"
+      ],
+      "key_characteristics": [
+        "No request/trace IDs beyond default web framework logs",
+        "No standardized LLM interaction event schema",
+        "No OpenTelemetry traces/metrics/logs",
+        "No explicit recording of user feedback, guardrail triggers, or evaluator scores"
+      ],
+      "code_paths_in_repo": [
+        "gateway/baseline_app.py",
+        "gateway/llm_client.py"
+      ]
+    }
+  },
+  "treatment": {
+    "description": "RCA-instrumented LLM gateway that emits structured LLM interaction events, OpenTelemetry traces/logs, and explicit RCA signals (feedback, guardrails, evaluator scores) into a minimal observability pipeline.",
+    "instrumentation_features": [
+      "Canonical LLM interaction event schema with request, response, routing, and context metadata",
+      "Stable correlation IDs across HTTP request, LLM call, and downstream tools (trace_id, span_id, interaction_id)",
+      "OpenTelemetry tracing with spans for HTTP request, LLM invocation, guardrail evaluation, and feedback recording",
+      "Structured logs (JSON) for each interaction event and sub-event using the common schema",
+      "Explicit RCA signals: user_feedback, guardrail_triggered, evaluator_score, failure_category",
+      "Configurable redaction and hashing for sensitive fields (raw prompts, user identifiers, tool arguments)"
+    ],
+    "privacy_and_safety_measures": [
+      "Redaction of raw user text by default, with optional safe sampling for non-prod",
+      "Hashing/pseudonymization of user_id/session_id before persistence",
+      "Configurable allowlist/denylist of logged fields via YAML config",
+      "Environment toggle to fully disable content capture in production environments"
+    ],
+    "implementation_outline": {
+      "components": [
+        "Instrumented FastAPI gateway app with OpenTelemetry middleware and manual spans",
+        "Event schema definition as Python dataclasses and JSON Schema",
+        "OpenTelemetry SDK initialization (OTLP exporter to local collector)",
+        "Local OpenTelemetry Collector configuration exporting traces/logs to stdout or file",
+        "Feedback endpoint to simulate and capture user feedback events",
+        "Simple guardrail function (e.g., regex-based or heuristic) emitting guardrail spans and events",
+        "Optional offline evaluator script scoring responses (synthetic quality/safety scores)"
+      ],
+      "code_paths_in_repo": [
+        "gateway/instrumented_app.py",
+        "gateway/instrumentation/schema.py",
+        "gateway/instrumentation/otel_setup.py",
+        "gateway/instrumentation/redaction.py",
+        "otel/collector-config.yaml",
+        "workloads/synthetic_workload.py",
+        "analysis/check_instrumentation_quality.py"
+      ]
+    }
+  },
+  "workloads": [
+    {
+      "name": "synthetic-mixed-traffic",
+      "description": "Synthetic mixed workload simulating diverse LLM usage patterns (short Q&A, RAG-like queries with metadata, multi-turn chat, and tool-like calls) with injected edge cases and failures to validate instrumentation coverage and data quality.",
+      "generator_script_path": "workloads/synthetic_workload.py",
+      "traffic_profile": {
+        "duration_seconds": 600,
+        "concurrency_levels": [
+          1,
+          5,
+          20
+        ],
+        "request_rate_target_rps": 5,
+        "request_mix": [
+          {
+            "type": "short_qa",
+            "weight": 0.4,
+            "example": "What is the capital of France?"
+          },
+          {
+            "type": "rag_like",
+            "weight": 0.25,
+            "example": "According to the internal policy corpus, what is our PTO policy?"
+          },
+          {
+            "type": "multi_turn_chat",
+            "weight": 0.2,
+            "example": "Help me draft an email to my manager about project delays."
+          },
+          {
+            "type": "tool_like",
+            "weight": 0.15,
+            "example": "Call the `calculate_total_cost` tool with parameters {\"items\": 3, \"price\": 19.99}."
+          }
+        ]
+      },
+      "failure_injection": {
+        "patterns": [
+          {
+            "name": "guardrail_violation",
+            "frequency": 0.05,
+            "behavior": "Inject prompts with banned phrases to trigger guardrail rules and record guardrail_triggered=true events."
+          },
+          {
+            "name": "llm_timeout",
+            "frequency": 0.03,
+            "behavior": "Artificially sleep beyond timeout threshold before returning or raising a timeout exception."
+          },
+          {
+            "name": "routing_error",
+            "frequency": 0.02,
+            "behavior": "Route some requests to a deliberately slow or error-prone mock model."
+          }
+        ]
+      },
+      "feedback_and_evaluation": {
+        "user_feedback_model": "Synthetic labeling based on prompt/response heuristics (e.g., reward simple factual correctness, penalize gibberish or guardrail hits).",
+        "feedback_endpoint_path": "/v1/feedback",
+        "evaluator_script_path": "analysis/offline_evaluator.py",
+        "signals_emitted": [
+          "user_feedback.score (0\u20131)",
+          "user_feedback.reason",
+          "evaluator_score.quality (0\u20131)",
+          "evaluator_score.safety (0\u20131)"
+        ]
+      }
+    }
+  ],
+  "controls": {
+    "environmental_controls": [
+      "Run baseline and treatment in identical container images except for instrumentation-specific dependencies.",
+      "Pin Python version (e.g., 3.11.x) and all Python dependencies via requirements.txt/poetry.lock.",
+      "Use the same LLM backend configuration (same model name, temperature, max_tokens, and provider) between baseline and treatment.",
+      "Run on the same host type (e.g., 4 vCPU, 8 GB RAM) or the same Kubernetes node pool.",
+      "Disable non-experiment background workloads on the host to reduce interference."
+    ],
+    "experimental_design": [
+      "Run synthetic-mixed-traffic against baseline first, then treatment, then repeat in reverse order (treatment then baseline) to check for drift.",
+      "Use deterministic random seeds for workload generation (e.g., --seed 42) so that baseline and treatment see identical request sequences.",
+      "Maintain identical workload parameters (duration, RPS, concurrency, failure injection config) across baseline and treatment runs.",
+      "Store raw telemetry outputs from baseline and treatment in separate, clearly named directories for later comparison."
+    ],
+    "privacy_controls": [
+      "Set instrumentation configuration to redact or hash any field labeled as potentially sensitive in the schema configuration file (e.g., config/instrumentation.yaml).",
+      "Ensure synthetic workload only uses non-PII prompts; when templates include names, use randomly generated or obviously synthetic entities.",
+      "Disable full prompt/response capture in production-like environment by default; enable only for local testing via environment flag (e.g., LLM_RCA_CAPTURE_CONTENT=true)."
+    ]
+  },
+  "metrics": [
+    {
+      "name": "gateway_p95_latency_ms",
+      "unit": "milliseconds"
+    },
+    {
+      "name": "gateway_mean_latency_ms",
+      "unit": "milliseconds"
+    },
+    {
+      "name": "gateway_error_rate",
+      "unit": "proportion_of_requests"
+    },
+    {
+      "name": "llm_call_p95_latency_ms",
+      "unit": "milliseconds"
+    },
+    {
+      "name": "instrumentation_overhead_ms_per_request",
+      "unit": "milliseconds"
+    },
+    {
+      "name": "events_per_request_mean",
+      "unit": "count"
+    },
+    {
+      "name": "trace_coverage_fraction",
+      "unit": "proportion_of_requests_with_root_trace"
+    },
+    {
+      "name": "schema_compliance_rate",
+      "unit": "proportion_of_events_passing_schema_validation"
+    },
+    {
+      "name": "event_linkage_rate",
+      "unit": "proportion_of_llm_spans_linked_to_http_spans"
+    },
+    {
+      "name": "feedback_signal_coverage",
+      "unit": "proportion_of_requests_with_feedback_or_evaluator_signals"
+    },
+    {
+      "name": "guardrail_trigger_capture_rate",
+      "unit": "proportion_of_guardrail_violations_logged_as_events"
+    },
+    {
+      "name": "sensitive_field_leak_rate",
+      "unit": "proportion_of_events_with_unredacted_sensitive_fields"
+    },
+    {
+      "name": "log_volume_per_request_kb",
+      "unit": "kilobytes_per_request"
+    },
+    {
+      "name": "otel_export_error_rate",
+      "unit": "proportion_of_spans_or_logs_failed_to_export"
+    }
+  ],
+  "success_criteria": {
+    "performance": [
+      "Relative increase in gateway_p95_latency_ms between baseline and treatment is \u2264 10%.",
+      "instrumentation_overhead_ms_per_request \u2264 15 ms on average under synthetic-mixed-traffic workload."
+    ],
+    "data_quality": [
+      "trace_coverage_fraction \u2265 0.98 for all successful HTTP requests.",
+      "event_linkage_rate \u2265 0.95 (LLM spans and interaction events correctly linked to HTTP request traces).",
+      "schema_compliance_rate \u2265 0.99 after JSON Schema validation of stored events."
+    ],
+    "rca_signal_coverage": [
+      "feedback_signal_coverage \u2265 0.9 for workloads where synthetic feedback is configured.",
+      "guardrail_trigger_capture_rate \u2265 0.98 for requests that hit the guardrail in application logic."
+    ],
+    "privacy_and_safety": [
+      "sensitive_field_leak_rate = 0 when redaction is enabled.",
+      "No raw prompts or user identifiers appear in stored telemetry when content capture is disabled by configuration."
+    ],
+    "operational_robustness": [
+      "otel_export_error_rate \u2264 0.01 during the experiment window.",
+      "No increase > 5% in gateway_error_rate attributable to instrumentation (e.g., exceptions in instrumentation code)."
+    ]
+  },
+  "failure_modes": [
+    {
+      "name": "high_latency_overhead",
+      "description": "Instrumentation adds excessive processing delay, causing p95 latency to regress beyond acceptable thresholds."
+    },
+    {
+      "name": "partial_or_inconsistent_tracing",
+      "description": "Not all HTTP requests produce root traces, or LLM spans are not reliably attached to the correct parent spans."
+    },
+    {
+      "name": "schema_drift_or_validation_failures",
+      "description": "Emitted events frequently fail schema validation, making downstream analysis brittle or unreliable."
+    },
+    {
+      "name": "privacy_leakage",
+      "description": "Sensitive data (raw user prompts, PII, internal URLs) are present in stored events despite redaction configuration."
+    },
+    {
+      "name": "excessive_log_volume",
+      "description": "Events and traces are too verbose, producing unsustainable log volume per request and potential storage/backpressure issues."
+    },
+    {
+      "name": "instrumentation-induced_errors",
+      "description": "Application returns 5xx errors or crashes due to instrumentation (e.g., exporter failures, serialization errors)."
+    },
+    {
+      "name": "missing_rca_signals",
+      "description": "Guardrail triggers, feedback scores, or evaluator outputs are not consistently captured and linked to the originating interaction."
+    }
+  ],
+  "required_environment": {
+    "runtime": {
+      "language": "Python",
+      "version": "3.11.x",
+      "dependencies_file": "requirements.txt",
+      "key_packages": [
+        "fastapi",
+        "uvicorn[standard]",
+        "httpx",
+        "pydantic",
+        "opentelemetry-api",
+        "opentelemetry-sdk",
+        "opentelemetry-instrumentation-fastapi",
+        "opentelemetry-exporter-otlp",
+        "jsonschema",
+        "typer",
+        "rich"
+      ]
+    },
+    "services": [
+      {
+        "name": "llm_backend",
+        "description": "LLM provider API or local model endpoint. For reproducibility, use an OpenAI-compatible mock server provided in the repo or a small local model.",
+        "configuration": {
+          "env_vars": [
+            "LLM_API_BASE",
+            "LLM_API_KEY",
+            "LLM_MODEL_NAME"
+          ]
+        }
+      },
+      {
+        "name": "opentelemetry_collector",
+        "description": "Local OpenTelemetry Collector instance receiving OTLP traces and logs from the instrumented gateway.",
+        "configuration": {
+          "config_file": "otel/collector-config.yaml",
+          "otlp_endpoint": "0.0.0.0:4317",
+          "outputs": [
+            "logging",
+            "file"
+          ]
+        }
+      }
+    ],
+    "infrastructure": {
+      "host": {
+        "cpu": ">= 4 vCPUs",
+        "memory_gb": 8,
+        "os": "Linux (Ubuntu 22.04 or similar) or macOS 13+"
+      },
+      "optional_orchestration": {
+        "docker": "24.x+",
+        "docker_compose": "v2.x+",
+        "kubernetes": "Optional, for readers who wish to run gateway and collector as pods."
+      }
+    },
+    "repository": {
+      "url": "https://github.com/bookauthority/automated-rca-llm-failures",
+      "branch": "main",
+      "paths_of_interest": [
+        "gateway/",
+        "otel/",
+        "workloads/",
+        "analysis/",
+        "config/"
+      ]
+    }
+  },
+  "run_instructions": [
+    "1. Clone the companion repository:\n   git clone https://github.com/bookauthority/automated-rca-llm-failures\n   cd automated-rca-llm-failures",
+    "2. Create and activate a Python virtual environment (example using venv):\n   python3.11 -m venv .venv\n   source .venv/bin/activate",
+    "3. Install dependencies:\n   pip install -r requirements.txt",
+    "4. Configure LLM backend for reproducible runs:\n   - For local/mock backend, follow instructions in README under gateway/ or mock_llm/ to start the mock LLM server.\n   - Set environment variables, for example:\n     export LLM_API_BASE=\"http://localhost:8001/v1\"\n     export LLM_API_KEY=\"test-key\"\n     export LLM_MODEL_NAME=\"mock-llm-v1\"",
+    "5. Start the OpenTelemetry Collector using the provided configuration:\n   otelcol --config otel/collector-config.yaml\n   # Or, if using Docker:\n   docker compose -f otel/docker-compose.yaml up",
+    "6. Run the BASELINE gateway (non-instrumented):\n   export LLM_RCA_INSTRUMENTATION_ENABLED=\"false\"\n   uvicorn gateway.baseline_app:app --host 0.0.0.0 --port 8000 --log-level info",
+    "7. In a separate terminal, run the synthetic workload against the baseline:\n   source .venv/bin/activate\n   python workloads/synthetic_workload.py \\\n       --api-base http://localhost:8000 \\\n       --duration-seconds 600 \\\n       --concurrency 5 \\\n       --target-rps 5 \\\n       --seed 42 \\\n       --output-dir runs/baseline\n   # This script should record basic HTTP metrics (latency, errors) and store them in runs/baseline/metrics.json.",
+    "8. Stop the baseline gateway process after the workload completes.",
+    "9. Run the TREATMENT gateway (instrumented):\n   export LLM_RCA_INSTRUMENTATION_ENABLED=\"true\"\n   export OTEL_EXPORTER_OTLP_ENDPOINT=\"http://localhost:4317\"\n   export LLM_RCA_REDACTION_CONFIG=\"config/instrumentation.yaml\"\n   uvicorn gateway.instrumented_app:app --host 0.0.0.0 --port 8000 --log-level info",
+    "10. In a separate terminal, re-run the same synthetic workload against the treatment:\n    source .venv/bin/activate\n    python workloads/synthetic_workload.py \\\n        --api-base http://localhost:8000 \\\n        --duration-seconds 600 \\\n        --concurrency 5 \\\n        --target-rps 5 \\\n        --seed 42 \\\n        --output-dir runs/treatment\n    # This script, when instrumentation is enabled, should additionally trigger feedback and evaluator calls\n    # and may provide simple summaries of observed guardrail hits and evaluator scores.",
+    "11. (Optional) Repeat runs in reverse order (treatment first, then baseline) to check for environmental drift, using a different output directory suffix (e.g., runs/baseline_2, runs/treatment_2).",
+    "12. Validate telemetry and instrumentation quality using the analysis script:\n    python analysis/check_instrumentation_quality.py \\\n        --baseline-run runs/baseline \\\n        --treatment-run runs/treatment \\\n        --otel-logs-dir otel/output \\\n        --schema-file config/llm_interaction_schema.json \\\n        --report-file runs/summary_report.json",
+    "13. Inspect the generated summary report and raw telemetry:\n    - runs/summary_report.json: high-level comparison of metrics and success criteria.\n    - otel/output/: raw traces/logs exported by the collector for manual inspection.\n    - runs/*/events.jsonl (if produced): raw structured LLM interaction events for schema validation and spot checks.",
+    "14. Manually verify privacy redaction:\n    - Grep for sample sensitive tokens from the synthetic workload (e.g., specific user names or emails) in otel/output and runs/*/events.jsonl.\n    - Confirm that, when redaction is enabled in config/instrumentation.yaml, these tokens do not appear in stored events.",
+    "15. Archive experiment artifacts for reproducibility:\n    - Tar or zip the runs/ directory, otel/output/, and relevant config files.\n    - Record Git commit hash and environment details (python --version, pip freeze) in a README within the run artifact directory."
+  ],
+  "evidence_schema": {
+    "baseline_metrics": {
+      "file_pattern": "runs/baseline/metrics.json",
+      "description": "Aggregated HTTP-level metrics for baseline runs.",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "gateway_p95_latency_ms": {
+            "type": "number"
+          },
+          "gateway_mean_latency_ms": {
+            "type": "number"
+          },
+          "gateway_error_rate": {
+            "type": "number"
+          },
+          "total_requests": {
+            "type": "integer"
+          },
+          "start_time": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "end_time": {
+            "type": "string",
+            "format": "date-time"
+          }
+        },
+        "required": [
+          "gateway_p95_latency_ms",
+          "gateway_mean_latency_ms",
+          "gateway_error_rate",
+          "total_requests",
+          "start_time",
+          "end_time"
+        ]
+      }
+    },
+    "treatment_metrics": {
+      "file_pattern": "runs/treatment/metrics.json",
+      "description": "Aggregated HTTP-level metrics for treatment runs, plus instrumentation-specific metrics if computed.",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "gateway_p95_latency_ms": {
+            "type": "number"
+          },
+          "gateway_mean_latency_ms": {
+            "type": "number"
+          },
+          "gateway_error_rate": {
+            "type": "number"
+          },
+          "llm_call_p95_latency_ms": {
+            "type": "number"
+          },
+          "instrumentation_overhead_ms_per_request": {
+            "type": "number"
+          },
+          "events_per_request_mean": {
+            "type": "number"
+          },
+          "log_volume_per_request_kb": {
+            "type": "number"
+          },
+          "total_requests": {
+            "type": "integer"
+          },
+          "start_time": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "end_time": {
+            "type": "string",
+            "format": "date-time"
+          }
+        },
+        "required": [
+          "gateway_p95_latency_ms",
+          "gateway_mean_latency_ms",
+          "gateway_error_rate",
+          "total_requests",
+          "start_time",
+          "end_time"
+        ]
+      }
+    },
+    "llm_interaction_events": {
+      "file_pattern": "runs/*/events.jsonl",
+      "description": "Line-delimited JSON records of LLM interaction events captured by the instrumented gateway.",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "interaction_id": {
+            "type": "string"
+          },
+          "trace_id": {
+            "type": "string"
+          },
+          "span_id": {
+            "type": "string"
+          },
+          "timestamp": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "request": {
+            "type": "object",
+            "properties": {
+              "user_id_hash": {
+                "type": "string"
+              },
+              "session_id_hash": {
+                "type": "string"
+              },
+              "prompt_redacted": {
+                "type": "string"
+              },
+              "prompt_tokens": {
+                "type": "integer"
+              },
+              "metadata": {
+                "type": "object"
+              }
+            },
+            "required": [
+              "prompt_redacted"
+            ]
+          },
+          "response": {
+            "type": "object",
+            "properties": {
+              "model": {
+                "type": "string"
+              },
+              "completion_redacted": {
+                "type": "string"
+              },
+              "completion_tokens": {
+                "type": "integer"
+              },
+              "latency_ms": {
+                "type": "number"
+              }
+            },
+            "required": [
+              "model",
+              "completion_redacted"
+            ]
+          },
+          "routing": {
+            "type": "object",
+            "properties": {
+              "route": {
+                "type": "string"
+              },
+              "model_variant": {
+                "type": "string"
+              }
+            }
+          },
+          "rca_signals": {
+            "type": "object",
+            "properties": {
+              "user_feedback": {
+                "type": "object",
+                "properties": {
+                  "score": {
+                    "type": "number"
+                  },
+                  "reason": {
+                    "type": "string"
+                  }
+                }
+              },
+              "guardrail": {
+                "type": "object",
+                "properties": {
+                  "triggered": {
+                    "type": "boolean"
+                  },
+                  "rule_id": {
+                    "type": "string"
+                  }
+                }
+              },
+              "evaluator_scores": {
+                "type": "object",
+                "properties": {
+                  "quality": {
+                    "type": "number"
+                  },
+                  "safety": {
+                    "type": "number"
+                  }
+                }
+              },
+              "failure_category": {
+                "type": "string"
+              }
+            }
+          }
+        },
+        "required": [
+          "interaction_id",
+          "timestamp",
+          "request",
+          "response"
+        ]
+      }
+    },
+    "otel_traces_and_logs": {
+      "file_pattern": "otel/output/*.log",
+      "description": "Raw OpenTelemetry export logs and traces as collected by the local collector.",
+      "schema": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "properties": {
+            "resource": {
+              "type": "object"
+            },
+            "scope": {
+              "type": "object"
+            },
+            "span": {
+              "type": "object",
+              "properties": {
+                "trace_id": {
+                  "type": "string"
+                },
+                "span_id": {
+                  "type": "string"
+                },
+                "parent_span_id": {
+                  "type": "string"
+                },
+                "name": {
+                  "type": "string"
+                },
+                "start_time_unix_nano": {
+                  "type": "string"
+                },
+                "end_time_unix_nano": {
+                  "type": "string"
+                },
+                "attributes": {
+                  "type": "object"
+                }
+              }
+            },
+            "log_record": {
+              "type": "object",
+              "properties": {
+                "time_unix_nano": {
+                  "type": "string"
+                },
+                "body": {
+                  "type": "object"
+                },
+                "attributes": {
+                  "type": "object"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "instrumentation_quality_report": {
+      "file_pattern": "runs/summary_report.json",
+      "description": "Computed metrics and pass/fail status against success criteria for this experiment.",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "baseline": {
+            "type": "object",
+            "properties": {
+              "gateway_p95_latency_ms": {
+                "type": "number"
+              },
+              "gateway_mean_latency_ms": {
+                "type": "number"
+              },
+              "gateway_error_rate": {
+                "type": "number"
+              }
+            }
+          },
+          "treatment": {
+            "type": "object",
+            "properties": {
+              "gateway_p95_latency_ms": {
+                "type": "number"
+              },
+              "gateway_mean_latency_ms": {
+                "type": "number"
+              },
+              "gateway_error_rate": {
+                "type": "number"
+              },
+              "llm_call_p95_latency_ms": {
+                "type": "number"
+              },
+              "instrumentation_overhead_ms_per_request": {
+                "type": "number"
+              },
+              "events_per_request_mean": {
+                "type": "number"
+              },
+              "trace_coverage_fraction": {
+                "type": "number"
+              },
+              "schema_compliance_rate": {
+                "type": "number"
+              },
+              "event_linkage_rate": {
+                "type": "number"
+              },
+              "feedback_signal_coverage": {
+                "type": "number"
+              },
+              "guardrail_trigger_capture_rate": {
+                "type": "number"
+              },
+              "sensitive_field_leak_rate": {
+                "type": "number"
+              },
+              "log_volume_per_request_kb": {
+                "type": "number"
+              },
+              "otel_export_error_rate": {
+                "type": "number"
+              }
+            }
+          },
+          "success_criteria_evaluation": {
+            "type": "object",
+            "properties": {
+              "performance": {
+                "type": "boolean"
+              },
+              "data_quality": {
+                "type": "boolean"
+              },
+              "rca_signal_coverage": {
+                "type": "boolean"
+              },
+              "privacy_and_safety": {
+                "type": "boolean"
+              },
+              "operational_robustness": {
+                "type": "boolean"
+              }
+            }
+          },
+          "notes": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "baseline",
+          "treatment",
+          "success_criteria_evaluation"
+        ]
+      }
+    }
+  }
+}

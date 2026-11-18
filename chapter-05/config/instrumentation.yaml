@@ -1,0 +1,4 @@
+# Minimal redaction configuration used by the offline experiment.
+# Parsed by a tiny hand-written YAML subset loader.
+redact_content: true
+hash_ids: true
